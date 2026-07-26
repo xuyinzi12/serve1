@@ -21,7 +21,7 @@ except ImportError:
     HAS_VLLM_EVENT_DEPS = False
 
 logger = logging.getLogger("kareserve.tracker")
-BlockHash = bytes | int | str
+WireBlockHash = bytes | int
 
 
 if HAS_VLLM_EVENT_DEPS:
@@ -29,8 +29,8 @@ if HAS_VLLM_EVENT_DEPS:
     class RawBlockStored(
         msgspec.Struct, tag="BlockStored", omit_defaults=True
     ):
-        block_hashes: List[BlockHash]
-        parent_block_hash: BlockHash | None
+        block_hashes: List[WireBlockHash]
+        parent_block_hash: WireBlockHash | None
         token_ids: List[int]
         block_size: int
         lora_id: int | None = None
@@ -45,7 +45,7 @@ if HAS_VLLM_EVENT_DEPS:
     class RawBlockRemoved(
         msgspec.Struct, tag="BlockRemoved", omit_defaults=True
     ):
-        block_hashes: List[BlockHash]
+        block_hashes: List[WireBlockHash]
         medium: str | None
         group_idx: int | None = None
         locality: str | None = None
