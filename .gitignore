@@ -1,0 +1,30 @@
+# Local configuration
+kareserve/config.json
+.env
+*.local.json
+
+# Local tests and experiment outputs
+kareserve/tests/
+benchmarks/results/
+results/
+logs/
+
+# Vendored reference source
+vllm/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

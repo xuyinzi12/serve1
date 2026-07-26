@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kareserve"
+version = "0.1.0"
+description = "Windowed prefix-aware router for distributed vLLM serving"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "fastapi>=0.110,<1",
+    "msgspec>=0.18,<1",
+    "pyzmq>=25,<28",
+    "uvicorn[standard]>=0.29,<1",
+]
+
+[project.scripts]
+kareserve-server = "kareserve.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kareserve*"]
+exclude = ["kareserve.tests*"]

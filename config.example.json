@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {
+      "node_id": "prefill-node-1",
+      "host": "10.0.0.11",
+      "port": 8000,
+      "kv_events_endpoint": "tcp://10.0.0.11:5557"
+    },
+    {
+      "node_id": "prefill-node-2",
+      "host": "10.0.0.12",
+      "port": 8000,
+      "kv_events_endpoint": "tcp://10.0.0.12:5557"
+    }
+  ],
+  "routing": {
+    "window_ms": 2.0,
+    "max_batch_size": 64,
+    "metrics_interval_seconds": 0.5,
+    "prefix_tokens_per_load_unit": 256.0,
+    "queue_weight": 1.0,
+    "group_block_size": 16
+  }
+}
