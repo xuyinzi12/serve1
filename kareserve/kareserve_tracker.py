@@ -27,7 +27,10 @@ WireBlockHash = bytes | int
 if HAS_VLLM_EVENT_DEPS:
 
     class RawBlockStored(
-        msgspec.Struct, tag="BlockStored", omit_defaults=True
+        msgspec.Struct,
+        array_like=True,
+        tag="BlockStored",
+        omit_defaults=True,
     ):
         block_hashes: List[WireBlockHash]
         parent_block_hash: WireBlockHash | None
@@ -43,7 +46,10 @@ if HAS_VLLM_EVENT_DEPS:
         locality: str | None = None
 
     class RawBlockRemoved(
-        msgspec.Struct, tag="BlockRemoved", omit_defaults=True
+        msgspec.Struct,
+        array_like=True,
+        tag="BlockRemoved",
+        omit_defaults=True,
     ):
         block_hashes: List[WireBlockHash]
         medium: str | None
@@ -51,7 +57,10 @@ if HAS_VLLM_EVENT_DEPS:
         locality: str | None = None
 
     class RawAllBlocksCleared(
-        msgspec.Struct, tag="AllBlocksCleared", omit_defaults=True
+        msgspec.Struct,
+        array_like=True,
+        tag="AllBlocksCleared",
+        omit_defaults=True,
     ):
         pass
 
