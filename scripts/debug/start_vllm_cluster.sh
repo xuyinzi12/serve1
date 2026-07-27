@@ -27,6 +27,7 @@ start_vllm() {
     CUDA_HOME="$CUDA_HOME" \
     CUDACXX="$CUDA_HOME/bin/nvcc" \
     PATH="$CUDA_HOME/bin:$PATH" \
+    VLLM_USE_FLASHINFER_SAMPLER=0 \
     "$ENV/bin/vllm" serve "$MODEL" \
     --served-model-name "$MODEL_NAME" \
     --host 127.0.0.1 \
