@@ -65,16 +65,23 @@ cp config.example.json runtime/config/kareserve.json
 
 ## 调试启动
 
-双 vLLM 实例使用 GPU 0 和 GPU 1：
+使用 GPU 1 启动单个调试实例：
 
 ```bash
-bash scripts/debug/start_vllm_cluster.sh
+GPU_IDS=1 ./scripts/debug/start_vllm_cluster.sh
+```
+
+使用 GPU 0 和 GPU 1 启动双实例：
+
+```bash
+GPU_IDS="0 1" ./scripts/debug/start_vllm_cluster.sh
 ```
 
 Router 使用端口 8090：
 
 ```bash
-bash scripts/debug/start_router.sh
+KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/examples/config.single-node.json \
+  ./scripts/debug/start_router.sh
 ```
 
 停止本项目启动的调试进程：
@@ -84,6 +91,12 @@ bash scripts/debug/stop_debug_cluster.sh
 ```
 
 运行日志位于 `runtime/logs/`，PID 文件位于 `runtime/pids/`。请求样例位于 `examples/smoke_request.json`。
+
+Router 路由状态地址为：
+
+```text
+http://127.0.0.1:8090/routing/state
+```
 
 ## 调度边界
 
