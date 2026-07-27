@@ -124,7 +124,17 @@ windowed_prefix
 
 窗口消融使用`window_ms=0`和`window_ms=2`。LMCache消融使用`runtime.enable_lmcache=false`和`true`。每个Manifest保持相同数据集、seed、模型、GPU、请求率和重复次数。
 
-## 8. 手工调试
+## 8. 验证LMCache跨vLLM进程复用
+
+单实例持续运行时，vLLM优先使用本实例GPU Prefix Cache。LMCache持久性测试保持LMCache Server运行，发送一次长Prefix请求，重启vLLM进程，随后发送相同请求：
+
+```bash
+GPU_IDS=1 bash scripts/experiment/verify_lmcache_persistence.sh
+```
+
+第一阶段负责Store，第二阶段负责Retrieve。第二阶段的`external_prefix_cache_hits_total`增长构成CPU KVCache复用证据。
+
+## 9. 手工调试
 
 手工启动单GPU Stack：
 

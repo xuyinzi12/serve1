@@ -172,6 +172,8 @@ bash scripts/debug/start_vllm_cluster.sh
 
 LMCache Server默认监听ZMQ端口`127.0.0.1:5555`和HTTP管理端口`127.0.0.1:8080`，CPU L1默认容量为32 GiB，淘汰策略为LRU。vLLM使用`LMCacheMPConnector`、`kv_both`角色和非Hybrid KV Cache Manager。`scripts/debug/lmcache_probe.py`提供确定性长Prefix请求和缓存指标输出。KaReserve从各vLLM`/metrics`读取LMCache查询量和命中量，并通过`/routing/state`输出累计命中率。
 
+`scripts/experiment/verify_lmcache_persistence.sh`保持LMCache Server运行并重启vLLM，验证KVCache跨vLLM进程Store和Retrieve。
+
 ## 项目边界
 
 KaReserve 管理请求窗口、Prefix逻辑分组、GPU本地 Prefix感知、容量与负载感知选点和 HTTP转发。vLLM 管理执行批次和 GPU KVCache。LMCache通过 vLLM KV Connector管理共享 CPU KVCache。当前单机路由不执行 GPU间 KVCache传输，也不在转发前调用 LMCache Lookup。vLLM连接器负责实际请求的 LMCache命中查询、加载和缓存锁生命周期。
