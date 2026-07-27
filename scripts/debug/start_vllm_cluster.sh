@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=/home/zn/xyz/serve1
 RUNTIME="$ROOT/runtime"
 ENV="$ROOT/.venv-vllm-0.26"
+CUDA_HOME="$ENV/lib/python3.12/site-packages/nvidia/cu13"
 MODEL=/home/zn/llm_models/opt-1.3b
 MODEL_NAME=kareserve-opt-1.3b
 
@@ -21,7 +22,12 @@ start_vllm() {
     return
   fi
 
-  nohup env CUDA_VISIBLE_DEVICES="$gpu" "$ENV/bin/vllm" serve "$MODEL" \
+  nohup env \
+    CUDA_VISIBLE_DEVICES="$gpu" \
+    CUDA_HOME="$CUDA_HOME" \
+    CUDACXX="$CUDA_HOME/bin/nvcc" \
+    PATH="$CUDA_HOME/bin:$PATH" \
+    "$ENV/bin/vllm" serve "$MODEL" \
     --served-model-name "$MODEL_NAME" \
     --host 127.0.0.1 \
     --port "$http_port" \
