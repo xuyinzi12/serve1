@@ -1,16 +1,16 @@
 {
   "nodes": [
     {
-      "node_id": "prefill-node-1",
-      "host": "10.0.0.11",
-      "port": 8000,
-      "kv_events_endpoint": "tcp://10.0.0.11:5557"
+      "node_id": "prefill-node-gpu0",
+      "host": "127.0.0.1",
+      "port": 8101,
+      "kv_events_endpoint": "tcp://127.0.0.1:5557"
     },
     {
-      "node_id": "prefill-node-2",
-      "host": "10.0.0.12",
-      "port": 8000,
-      "kv_events_endpoint": "tcp://10.0.0.12:5557"
+      "node_id": "prefill-node-gpu1",
+      "host": "127.0.0.1",
+      "port": 8102,
+      "kv_events_endpoint": "tcp://127.0.0.1:5558"
     }
   ],
   "routing": {

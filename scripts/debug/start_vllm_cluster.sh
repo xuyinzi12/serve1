@@ -47,6 +47,7 @@ for gpu in ${GPU_IDS:-0 1}; do
   case "$gpu" in
     0) start_vllm 0 8101 5557 vllm-gpu0 ;;
     1) start_vllm 1 8102 5558 vllm-gpu1 ;;
+    2) start_vllm 2 8103 5559 vllm-gpu2 ;;
     *)
       echo "unsupported debug GPU: $gpu" >&2
       exit 2

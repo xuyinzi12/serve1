@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing policies for the Kareserve gateway."""
 
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
@@ -63,6 +64,8 @@ class NodeState:
 
 
 class KareserveBasePolicy(ABC):
+    name = "base"
+
     @abstractmethod
     def select_node(
         self,
@@ -115,6 +118,8 @@ class KareserveBasePolicy(ABC):
 
 class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
     """Greedy prefix-affinity policy with per-window virtual load."""
+
+    name = "windowed_prefix"
 
     def __init__(
         self,
@@ -234,6 +239,8 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
 class ExampleTemplatePolicy(KareserveBasePolicy):
     """Compatibility policy retained for existing experiments."""
 
+    name = "example_template"
+
     def __init__(self, weight_prefix: float = 1.0, weight_queue: float = 1.0) -> None:
         self.weight_prefix = weight_prefix
         self.weight_queue = weight_queue
@@ -263,6 +270,8 @@ class ExampleTemplatePolicy(KareserveBasePolicy):
 
 
 class LeastLoadPolicy(KareserveBasePolicy):
+    name = "least_load"
+
     def select_node(
         self,
         request: SchedulerRequest,
@@ -272,9 +281,100 @@ class LeastLoadPolicy(KareserveBasePolicy):
             return None
         return min(cluster_nodes.values(), key=lambda node: node.observed_load)
 
+    def select_node_with_load(
+        self,
+        request: SchedulerRequest,
+        cluster_nodes: Dict[str, NodeState],
+        virtual_load: Dict[str, float],
+    ) -> Optional[NodeState]:
+        if not cluster_nodes:
+            return None
+        return min(
+            cluster_nodes.values(),
+            key=lambda node: (
+                virtual_load.get(node.node_id, node.observed_load),
+                node.node_id,
+            ),
+        )
+
+    def select_batch(
+        self,
+        requests: List[SchedulerRequest],
+        cluster_nodes: Dict[str, NodeState],
+    ) -> Dict[str, NodeState]:
+        virtual_load = {
+            node_id: node.observed_load for node_id, node in cluster_nodes.items()
+        }
+        assignments: Dict[str, NodeState] = {}
+        for request in requests:
+            node = self.select_node_with_load(request, cluster_nodes, virtual_load)
+            if node is None:
+                continue
+            assignments[request.request_id] = node
+            virtual_load[node.node_id] += self.request_work(request)
+        return assignments
+
+
+class RoundRobinPolicy(KareserveBasePolicy):
+    """Deterministic request-order round robin baseline."""
+
+    name = "round_robin"
+
+    def __init__(self) -> None:
+        self._next_index = 0
+
+    def select_node(
+        self,
+        request: SchedulerRequest,
+        cluster_nodes: Dict[str, NodeState],
+    ) -> Optional[NodeState]:
+        if not cluster_nodes:
+            return None
+        nodes = sorted(cluster_nodes.values(), key=lambda node: node.node_id)
+        node = nodes[self._next_index % len(nodes)]
+        self._next_index += 1
+        return node
+
+    def select_batch(
+        self,
+        requests: List[SchedulerRequest],
+        cluster_nodes: Dict[str, NodeState],
+    ) -> Dict[str, NodeState]:
+        assignments: Dict[str, NodeState] = {}
+        for request in requests:
+            node = self.select_node(request, cluster_nodes)
+            if node is not None:
+                assignments[request.request_id] = node
+        return assignments
+
+
+class PrefixHashPolicy(KareserveBasePolicy):
+    """Stable prefix-to-node mapping baseline."""
+
+    name = "prefix_hash"
+
+    def __init__(self, prefix_hash_tokens: int = 256) -> None:
+        self.prefix_hash_tokens = max(1, prefix_hash_tokens)
+
+    def select_node(
+        self,
+        request: SchedulerRequest,
+        cluster_nodes: Dict[str, NodeState],
+    ) -> Optional[NodeState]:
+        if not cluster_nodes:
+            return None
+        nodes = sorted(cluster_nodes.values(), key=lambda node: node.node_id)
+        prefix = request.prompt_tokens[: self.prefix_hash_tokens]
+        key = ",".join(str(token) for token in prefix).encode("ascii")
+        digest = hashlib.blake2b(key, digest_size=8).digest()
+        index = int.from_bytes(digest, byteorder="big") % len(nodes)
+        return nodes[index]
+
 
 class KareserveMediumAwarePolicy(WindowedPrefixAffinityPolicy):
     """Compatibility wrapper for the original hardware-profile constructor."""
+
+    name = "medium_aware"
 
     def __init__(self, hardware_profile: Optional[Dict[str, Any]] = None) -> None:
         profile = hardware_profile or {}

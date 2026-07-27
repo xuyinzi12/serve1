@@ -1,103 +1,114 @@
 # KaReserve
 
-KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，根据公共 Token Prefix、各实例的 KVCache 状态和运行负载完成实例分配，然后将请求转发给 vLLM 执行 Continuous Batching。
+KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，根据公共 Token Prefix、各实例的本地 KVCache 和运行负载完成实例分配。vLLM 继续负责 Continuous Batching、Paged KVCache 和模型执行。
 
-## 目录结构
+## 请求链路
 
 ```text
-serve1/
-├── kareserve/                 Router 源码
-├── scripts/
-│   ├── env/                  环境安装与软件源检测
-│   └── debug/                双实例和 Router 联调脚本
-├── examples/                 请求样例与 OPT Chat Template
-├── runtime/                  服务器运行产物，不进入 Git
-│   ├── config/
-│   ├── logs/
-│   ├── pids/
-│   └── reports/
-├── .venv-vllm-0.26/          服务器独立运行环境，不进入 Git
-├── config.example.json
-└── pyproject.toml
+Benchmark / Client
+        ↓
+KaReserve Router
+  1. 调用 vLLM /tokenize
+  2. 进入短时 Request Pool
+  3. 执行窗口级路由策略
+  4. 转发到目标 vLLM
+        ↓
+vLLM Continuous Batching
 ```
 
-## vLLM 0.26 环境
+Router 提供以下接口：
 
-服务器环境路径为：
+- `POST /tokenize`
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+- `GET /health`
+- `GET /routing/state`
+
+Completion 响应包含目标实例、路由策略、窗口大小、Router 等待时间和 Prefix 命中长度等响应头。Router 日志为每个请求记录一条 `route_decision` JSON。
+
+## 路由策略
+
+`routing.policy` 支持以下值：
+
+- `round_robin`：按照窗口到达顺序轮询实例。
+- `least_load`：按照实例负载和窗口内虚拟负载分配。
+- `prefix_hash`：将固定长度 Prefix 稳定映射到实例。
+- `windowed_prefix`：按共享 Prefix 分组，并联合考虑缓存命中与实例负载。
+
+`routing.window_ms=0` 表示逐请求立即分配。正数窗口表示 Router 最多等待对应时间收集请求。`routing.max_batch_size` 会提前触发窗口处理。
+
+```json
+{
+  "routing": {
+    "policy": "windowed_prefix",
+    "window_ms": 2.0,
+    "max_batch_size": 64,
+    "prefix_hash_tokens": 256,
+    "prefix_tokens_per_load_unit": 256.0,
+    "queue_weight": 1.0,
+    "group_block_size": 16
+  }
+}
+```
+
+## 运行环境
+
+服务器独立环境位于：
 
 ```text
 /home/zn/xyz/serve1/.venv-vllm-0.26
 ```
 
-绝对路径调用能够明确选择版本：
-
-```bash
-/home/zn/xyz/serve1/.venv-vllm-0.26/bin/vllm --version
-/home/zn/xyz/serve1/.venv-vllm-0.26/bin/python --version
-```
-
-交互式操作可以激活环境：
-
-```bash
-cd /home/zn/xyz/serve1
-source .venv-vllm-0.26/bin/activate
-vllm --version
-python --version
-deactivate
-```
-
-激活只会修改当前 Shell 的命令搜索路径。新终端需要重新激活。现有 `/home/zn/vllm_advanced_env` 继续提供 vLLM 0.18.0。
-
-环境安装脚本支持重复执行：
-
-```bash
-bash scripts/env/install_vllm_026.sh
-```
-
-## 配置
-
-```bash
-mkdir -p runtime/config runtime/logs runtime/pids runtime/reports
-cp config.example.json runtime/config/kareserve.json
-```
-
-`group_block_size` 需要与 vLLM Prefix Cache 的 Block 粒度保持一致。每个 vLLM 实例需要提供 OpenAI API、`/tokenize`、`/metrics` 和独立的 KV Event Endpoint。
+该环境与 `/home/zn/vllm_advanced_env` 隔离。源码通过工作目录直接加载，当前调试流程不要求安装 KaReserve wheel。
 
 ## 调试启动
 
-使用 GPU 1 启动单个调试实例：
+调试脚本只支持 GPU 0、GPU 1、GPU 2。每张 GPU 对应独立的 HTTP 端口和 KV Event 端口。
 
 ```bash
-GPU_IDS=1 ./scripts/debug/start_vllm_cluster.sh
-```
+cd /home/zn/xyz/serve1
+GPU_IDS=1 bash scripts/debug/start_vllm_cluster.sh
 
-使用 GPU 0 和 GPU 1 启动双实例：
-
-```bash
-GPU_IDS="0 1" ./scripts/debug/start_vllm_cluster.sh
-```
-
-Router 使用端口 8090：
-
-```bash
 KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/examples/config.single-node.json \
-  ./scripts/debug/start_router.sh
+  bash scripts/debug/start_router.sh
 ```
 
-停止本项目启动的调试进程：
+双实例启动需要确认两张 GPU 均为空闲：
+
+```bash
+GPU_IDS="0 1" bash scripts/debug/start_vllm_cluster.sh
+```
+
+停止项目启动的全部调试进程：
 
 ```bash
 bash scripts/debug/stop_debug_cluster.sh
 ```
 
-运行日志位于 `runtime/logs/`，PID 文件位于 `runtime/pids/`。请求样例位于 `examples/smoke_request.json`。
+停止脚本根据 PID 文件和 serve1 命令路径核对进程归属。运行日志、PID、Benchmark 结果和独立环境均位于 Git 忽略目录。
 
-Router 路由状态地址为：
+## vLLM Benchmark
 
-```text
-http://127.0.0.1:8090/routing/state
+Router 接口兼容 `vllm bench serve` 的 Chat Completions 和 Completions 请求。Prefix 基础测试示例：
+
+```bash
+.venv-vllm-0.26/bin/vllm bench serve \
+  --backend openai-chat \
+  --base-url http://127.0.0.1:8090 \
+  --endpoint /v1/chat/completions \
+  --model kareserve-opt-1.3b \
+  --tokenizer /home/zn/llm_models/opt-1.3b \
+  --dataset-name prefix_repetition \
+  --num-prompts 32 \
+  --prefix-repetition-prefix-len 512 \
+  --prefix-repetition-suffix-len 64 \
+  --prefix-repetition-num-prefixes 4 \
+  --prefix-repetition-output-len 16 \
+  --request-rate 20
 ```
 
-## 调度边界
+正式策略对比需要复用相同模型、seed、请求轨迹和冷缓存启动流程。Round Robin、Prefix Hash、Window=0 和 Windowed Prefix 分别运行并独立保存结果。
 
-KaReserve 负责请求窗口聚合、公共 Prefix 分组、KVCache 与负载感知的实例选择和 HTTP 转发。vLLM 负责 Continuous Batching、Paged KVCache 和模型执行。LMCache 通过兼容的 vLLM KVConnector 接入外部 KVCache 存储与加载。
+## 项目边界
+
+KaReserve 管理请求窗口、Prefix 分组、实例选择和 HTTP 转发。vLLM 管理执行批次和 GPU KVCache。LMCache 通过 vLLM KV Connector 管理外部 KVCache，LMCache MP Server 的跨实例共享需要独立安装与验证。
