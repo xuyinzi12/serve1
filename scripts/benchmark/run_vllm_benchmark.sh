@@ -19,8 +19,6 @@ RESULT_DIR=${KARESERVE_RESULT_DIR:-"$ROOT/runtime/benchmarks"}
 BENCH_LABEL=${KARESERVE_BENCH_LABEL:-windowed-prefix}
 RESULT_FILENAME=${KARESERVE_RESULT_FILENAME:-"${BENCH_LABEL}-${DATASET_NAME}.json"}
 
-mkdir -p "$RESULT_DIR"
-
 args=(
   bench serve
   --backend "$BACKEND"
@@ -74,4 +72,5 @@ if [[ "${KARESERVE_BENCH_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+mkdir -p "$RESULT_DIR"
 exec "$ENV/bin/vllm" "${args[@]}"
