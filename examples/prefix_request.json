@@ -1,0 +1,11 @@
+{
+  "model": "kareserve-opt-1.3b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Shared prefix test context: cache routing systems compare reusable prompt blocks across inference instances. Shared prefix test context: cache routing systems compare reusable prompt blocks across inference instances. Shared prefix test context: cache routing systems compare reusable prompt blocks across inference instances. Return one word."
+    }
+  ],
+  "max_tokens": 4,
+  "stream": true
+}

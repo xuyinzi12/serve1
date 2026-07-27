@@ -217,3 +217,22 @@ async def health_check():
         "nodes": [node.node_id for node in tracker.get_node_states().values()],
         "queued_requests": request_pool.queue.qsize(),
     }
+
+
+@app.get("/routing/state")
+async def routing_state():
+    states = tracker.get_node_states()
+    return {
+        "nodes": {
+            node_id: {
+                "endpoint": node.endpoint_url,
+                "active_requests": node.active_requests,
+                "running_requests": node.running_requests,
+                "waiting_requests": node.waiting_requests,
+                "kv_cache_usage": node.kv_cache_usage,
+                "cached_blocks": len(node.cached_blocks),
+            }
+            for node_id, node in states.items()
+        },
+        "queued_requests": request_pool.queue.qsize(),
+    }
