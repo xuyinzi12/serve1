@@ -17,6 +17,8 @@ MAX_CONCURRENCY=${KARESERVE_MAX_CONCURRENCY:-64}
 SEED=${KARESERVE_SEED:-0}
 READY_CHECK_TIMEOUT=${KARESERVE_READY_CHECK_TIMEOUT_SECONDS:-0}
 NUM_WARMUPS=${KARESERVE_NUM_WARMUPS:-0}
+TEMPERATURE=${KARESERVE_TEMPERATURE:-0}
+IGNORE_EOS=${KARESERVE_IGNORE_EOS:-1}
 RESULT_DIR=${KARESERVE_RESULT_DIR:-"$ROOT/runtime/benchmarks"}
 BENCH_LABEL=${KARESERVE_BENCH_LABEL:-windowed-prefix}
 RESULT_FILENAME=${KARESERVE_RESULT_FILENAME:-"${BENCH_LABEL}-${DATASET_NAME}.json"}
@@ -35,10 +37,15 @@ args=(
   --seed "$SEED"
   --ready-check-timeout-sec "$READY_CHECK_TIMEOUT"
   --num-warmups "$NUM_WARMUPS"
+  --temperature "$TEMPERATURE"
   --save-result
   --result-dir "$RESULT_DIR"
   --result-filename "$RESULT_FILENAME"
 )
+
+if [[ "$IGNORE_EOS" == "1" ]]; then
+  args+=(--ignore-eos)
+fi
 
 case "$DATASET_NAME" in
   prefix_repetition)

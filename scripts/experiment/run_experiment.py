@@ -82,6 +82,8 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
         "KARESERVE_MAX_CONCURRENCY": benchmark.get("max_concurrency", 64),
         "KARESERVE_SEED": benchmark.get("seed", 0),
         "KARESERVE_NUM_WARMUPS": benchmark.get("num_warmups", 0),
+        "KARESERVE_TEMPERATURE": benchmark.get("temperature", 0),
+        "KARESERVE_IGNORE_EOS": benchmark.get("ignore_eos", True),
         "KARESERVE_READY_CHECK_TIMEOUT_SECONDS": benchmark.get(
             "ready_check_timeout_seconds", 0
         ),

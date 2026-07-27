@@ -37,6 +37,8 @@ HTTP端口接收`/tokenize`、`/v1/completions`和`/metrics`。KV Event端口通
 
 运行器会停止本项目旧进程、启动8 GiB LMCache、启动GPU1上的vLLM、等待服务健康、启动Router、发送32个请求、保存结果并停止本轮进程。
 
+Benchmark默认使用`temperature=0`和`ignore_eos=true`，相同输入产生确定性采样路径并执行固定输出长度。
+
 结果位于：
 
 ```text

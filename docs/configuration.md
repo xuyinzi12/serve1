@@ -81,6 +81,8 @@ Router JSON提供节点与策略完整配置
 | `KARESERVE_REQUEST_RATE` | 目标请求率 | `20` |
 | `KARESERVE_MAX_CONCURRENCY` | 最大在途请求数 | `64` |
 | `KARESERVE_SEED` | 数据与到达过程随机种子 | `0` |
+| `KARESERVE_TEMPERATURE` | 采样温度 | `0` |
+| `KARESERVE_IGNORE_EOS` | 固定输出长度 | `1` |
 
 启动脚本会校验GPU编号与Router端口映射。缺失Router JSON、重复节点ID、错误Tokenizer节点和GPU端口不一致都会使启动失败。
 
