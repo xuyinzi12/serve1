@@ -66,11 +66,7 @@ def load_config(
 ) -> tuple[List[NodeState], KareserveBasePolicy, Dict[str, Any]]:
     path = Path(config_path)
     if not path.is_file():
-        nodes = [
-            NodeState("node-1", "127.0.0.1", 8101),
-            NodeState("node-2", "127.0.0.1", 8102),
-        ]
-        return nodes, WindowedPrefixAffinityPolicy(), {}
+        raise FileNotFoundError(f"Router configuration does not exist: {path}")
 
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
@@ -78,6 +74,16 @@ def load_config(
         NodeState(node_id=node["node_id"], host=node["host"], port=node["port"])
         for node in data.get("nodes", [])
     ]
+    if not nodes:
+        raise ValueError("Router configuration must contain at least one node")
+    node_ids = {node.node_id for node in nodes}
+    if len(node_ids) != len(nodes):
+        raise ValueError("Router node_id values must be unique")
+    tokenizer_node_id = data.get("tokenizer_node_id")
+    if tokenizer_node_id not in node_ids:
+        raise ValueError(
+            "tokenizer_node_id must identify one configured Router node"
+        )
     routing = dict(data.get("routing", {}))
     policy_override = os.environ.get("KARESERVE_POLICY_OVERRIDE")
     window_override = os.environ.get("KARESERVE_WINDOW_MS_OVERRIDE")
@@ -102,6 +108,17 @@ request_pool = RequestPool(
     max_batch_size=int(routing_config.get("max_batch_size", 64)),
 )
 _metrics_task: asyncio.Task[None] | None = None
+
+
+def get_tokenizer_node(states: Dict[str, NodeState]) -> NodeState:
+    node_id = str(config["tokenizer_node_id"])
+    node = states.get(node_id)
+    if node is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Tokenizer node is unavailable: {node_id}",
+        )
+    return node
 
 
 async def poll_metrics() -> None:
@@ -281,7 +298,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     states = tracker.get_node_states()
     if not states:
         raise HTTPException(status_code=503, detail="No available vLLM servers")
-    tokenizer_node = next(iter(states.values()))
+    tokenizer_node = get_tokenizer_node(states)
     prompt_tokens = await tokenize_request(tokenizer_node, body)
     request_id = str(
         body.get("request_id")
@@ -385,7 +402,7 @@ async def tokenize(raw_request: Request):
     states = tracker.get_node_states()
     if not states:
         raise HTTPException(status_code=503, detail="No available vLLM servers")
-    node = next(iter(states.values()))
+    node = get_tokenizer_node(states)
     session, upstream = await open_upstream(
         node,
         "/tokenize",

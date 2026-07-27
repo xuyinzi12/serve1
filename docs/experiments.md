@@ -2,20 +2,19 @@
 
 ## 环境
 
-服务器保留两个独立环境：
+服务器使用一个项目环境：
 
 ```text
-.venv-vllm-0.26          vLLM 0.26、Torch、CUDA和Benchmark
-.venv-vllm-0.26-lmcache  LMCache Overlay，复用基础环境
+.venv-vllm-0.26  vLLM 0.26、Torch、CUDA、LMCache和Benchmark
 ```
 
-LMCache 0.5.2涉及NumPy、OpenTelemetry和Prometheus依赖变更。LMCache Overlay通过`.pth`读取基础环境中的vLLM、Torch和CUDA，并保存LMCache专用依赖。统一启动脚本默认选择Overlay环境；`KARESERVE_ENABLE_LMCACHE=0`使启动脚本选择基础环境。日常运行无需执行`activate`。
+LMCache开关改变vLLM Connector启动参数。所有实验使用相同Python环境。
 
 ```bash
-# 默认启用LMCache并自动使用Overlay环境
+# 默认启用LMCache
 GPU_IDS=1 bash scripts/debug/start_stack.sh
 
-# 关闭LMCache并自动使用基础环境
+# 关闭LMCache
 KARESERVE_ENABLE_LMCACHE=0 GPU_IDS=1 bash scripts/debug/start_stack.sh
 ```
 
@@ -23,7 +22,7 @@ KARESERVE_ENABLE_LMCACHE=0 GPU_IDS=1 bash scripts/debug/start_stack.sh
 
 ```bash
 .venv-vllm-0.26/bin/python -m vllm --help
-.venv-vllm-0.26-lmcache/bin/python -c "import vllm, lmcache"
+.venv-vllm-0.26/bin/python -c "import vllm, lmcache"
 ```
 
 ## 模型

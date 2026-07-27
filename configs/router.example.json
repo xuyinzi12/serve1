@@ -13,6 +13,7 @@
       "kv_events_endpoint": "tcp://10.0.0.12:5557"
     }
   ],
+  "tokenizer_node_id": "prefill-node-1",
   "routing": {
     "policy": "windowed_prefix",
     "window_ms": 2.0,

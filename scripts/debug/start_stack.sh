@@ -6,14 +6,32 @@ GPU_IDS=${GPU_IDS:-1}
 ENABLE_LMCACHE=${KARESERVE_ENABLE_LMCACHE:-1}
 ROUTER_CONFIG=${KARESERVE_CONFIG_PATH:-"$ROOT/configs/router.single-node.json"}
 STARTUP_TIMEOUT_SECONDS=${KARESERVE_STARTUP_TIMEOUT_SECONDS:-120}
+PROJECT_ENV="$ROOT/.venv-vllm-0.26"
+
+"$PROJECT_ENV/bin/python" "$ROOT/scripts/experiment/validate_run.py" \
+  --config "$ROUTER_CONFIG" \
+  --gpu-ids $GPU_IDS
 
 if [[ "$ENABLE_LMCACHE" == "1" ]]; then
   bash "$ROOT/scripts/debug/start_lmcache_server.sh"
-  export VLLM_ENV=${VLLM_ENV:-"$ROOT/.venv-vllm-0.26-lmcache"}
+  export VLLM_ENV=${VLLM_ENV:-"$PROJECT_ENV"}
   export KARESERVE_LMCACHE_MP=1
 else
-  export VLLM_ENV=${VLLM_ENV:-"$ROOT/.venv-vllm-0.26"}
+  export VLLM_ENV=${VLLM_ENV:-"$PROJECT_ENV"}
   export KARESERVE_LMCACHE_MP=0
+fi
+
+if [[ "$ENABLE_LMCACHE" == "1" ]]; then
+  elapsed=0
+  until curl -fsS "http://127.0.0.1:${LMCACHE_HTTP_PORT:-8080}/healthcheck" \
+      >/dev/null 2>&1; do
+    if (( elapsed >= STARTUP_TIMEOUT_SECONDS )); then
+      echo "LMCache did not become ready" >&2
+      exit 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
 fi
 
 GPU_IDS="$GPU_IDS" bash "$ROOT/scripts/debug/start_vllm_cluster.sh"
@@ -45,5 +63,15 @@ done
 
 KARESERVE_CONFIG_PATH="$ROUTER_CONFIG" \
   bash "$ROOT/scripts/debug/start_router.sh"
+
+elapsed=0
+until curl -fsS "http://127.0.0.1:8090/health" >/dev/null 2>&1; do
+  if (( elapsed >= STARTUP_TIMEOUT_SECONDS )); then
+    echo "KaReserve Router did not become ready" >&2
+    exit 1
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
 
 echo "stack ready: router=http://127.0.0.1:8090"

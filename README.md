@@ -9,10 +9,13 @@ kareserve/          Router核心代码
 configs/            通用、单节点和双实例配置
 scripts/debug/      本地服务启动、停止和LMCache探测
 scripts/benchmark/  硬件测速与工作负载Benchmark
+scripts/data/       数据转换与确定性Trace生成
+scripts/experiment/ Manifest校验与实验执行
+configs/experiments/正式实验Manifest
 docs/               架构与实验说明
 ```
 
-`configs/router.example.json`提供通用配置字段；`configs/router.single-node.json`保存当前单节点实测配置；`configs/router.two-node.json`提供双节点模板。完整架构与多实体方向见[架构文档](docs/architecture.md)，启动、模型、数据集和对比实验见[实验文档](docs/experiments.md)。
+`configs/router.example.json`提供通用配置字段；`configs/router.single-node.json`保存当前单节点实测配置；`configs/router.two-node.json`提供双节点模板。完整架构与多实体方向见[架构文档](docs/architecture.md)，配置优先级见[配置文档](docs/configuration.md)，实际操作见[启动测试教程](docs/quickstart.md)，对比实验见[实验文档](docs/experiments.md)。
 
 ## 请求链路
 
@@ -76,7 +79,7 @@ Completion 响应包含目标实例、路由策略、窗口大小、Router 等�
 CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本通过 CUDA Event 测量多个数据尺寸，并输出线性拟合带宽、固定延迟和各尺寸分位延迟：
 
 ```bash
-.venv-vllm-0.26-lmcache/bin/python \
+.venv-vllm-0.26/bin/python \
   scripts/benchmark/measure_h2d_bandwidth.py \
   --device 1 \
   --sizes-mib 1,4,16,64 \
@@ -100,16 +103,13 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 
 ## 运行环境
 
-服务器保留两个运行环境：
+服务器使用一个项目运行环境：
 
 ```text
-/home/zn/xyz/serve1/.venv-vllm-0.26          vLLM、Torch、CUDA和Benchmark
-/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache  LMCache运行入口
+/home/zn/xyz/serve1/.venv-vllm-0.26
 ```
 
-LMCache 0.5.2涉及NumPy、OpenTelemetry和Prometheus依赖变更。Overlay环境保存LMCache专用依赖，并通过`.pth`读取基础环境中的vLLM、Torch和CUDA。该结构保持基础vLLM环境的依赖版本稳定。
-
-统一启动脚本根据`KARESERVE_ENABLE_LMCACHE`自动选择Python。默认值`1`使用Overlay环境，值`0`使用基础环境。日常启动无需激活环境。手工运行命令时可以直接使用对应环境的Python；交互式排查可以激活其中一个环境，同一Shell只需激活当前命令所需的环境。
+该环境包含vLLM 0.26.0、Torch 2.11.0、CUDA 13运行库和LMCache 0.5.2。`KARESERVE_ENABLE_LMCACHE`控制vLLM是否启用LMCache Connector，功能开关不切换Python环境。日常启动无需执行`activate`。
 
 ## 调试启动
 
@@ -154,13 +154,7 @@ bash scripts/benchmark/run_vllm_benchmark.sh
 
 ## LMCache MP
 
-LMCache 使用独立环境：
-
-```text
-/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache
-```
-
-该环境通过 `.pth` 只读引用基础 vLLM 0.26 环境，并单独安装 LMCache 0.5.2、SortedContainers 和 CuPy CUDA 13。基础环境中的 vLLM、Torch、CUDA、OpenTelemetry 和 Prometheus 版本保持不变。
+LMCache和vLLM使用同一个项目环境。LMCache开关只改变vLLM启动参数。
 
 启动独立 LMCache Server：
 
@@ -171,13 +165,12 @@ bash scripts/debug/start_lmcache_server.sh
 启动连接 LMCache MP Server 的 vLLM：
 
 ```bash
-VLLM_ENV=/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache \
 KARESERVE_LMCACHE_MP=1 \
 GPU_IDS=1 \
 bash scripts/debug/start_vllm_cluster.sh
 ```
 
-LMCache Server 默认监听 `127.0.0.1:5555`，CPU L1 缓存容量为 2 GiB，淘汰策略为 LRU。LMCache 自身 observability 在调试配置中关闭，vLLM external prefix cache metrics 保持启用。vLLM 使用 `LMCacheMPConnector`、`kv_both` 角色和非 Hybrid KV Cache Manager。单 GPU 测试通过保持 LMCache Server 运行并顺序重启 vLLM，验证外部 KVCache 的 Store、Lookup 和 Retrieve。`scripts/debug/lmcache_probe.py` 提供确定性长 Prefix 请求和缓存指标输出。KaReserve 从各 vLLM `/metrics` 读取 LMCache 查询量和命中量，并通过 `/routing/state` 输出累计命中率。跨 GPU 并发共享需要两张空闲 GPU。
+LMCache Server默认监听ZMQ端口`127.0.0.1:5555`和HTTP管理端口`127.0.0.1:8080`，CPU L1默认容量为32 GiB，淘汰策略为LRU。vLLM使用`LMCacheMPConnector`、`kv_both`角色和非Hybrid KV Cache Manager。`scripts/debug/lmcache_probe.py`提供确定性长Prefix请求和缓存指标输出。KaReserve从各vLLM`/metrics`读取LMCache查询量和命中量，并通过`/routing/state`输出累计命中率。
 
 ## 项目边界
 

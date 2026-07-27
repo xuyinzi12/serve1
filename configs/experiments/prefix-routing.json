@@ -1,0 +1,31 @@
+{
+  "name": "prefix-routing",
+  "router_config": "configs/router.two-node.json",
+  "repeats": 3,
+  "settle_seconds": 2,
+  "runtime": {
+    "gpu_ids": [0, 1],
+    "enable_lmcache": true,
+    "lmcache_l1_size_gb": 32,
+    "model": "/home/zn/llm_models/opt-1.3b",
+    "model_name": "kareserve-opt-1.3b",
+    "dtype": "half",
+    "gpu_memory_utilization": 0.5
+  },
+  "router_overrides": {
+    "policy": "windowed_prefix",
+    "window_ms": 2
+  },
+  "benchmark": {
+    "dataset_name": "timed_trace",
+    "dataset_path": "runtime/datasets/prefix-trace.jsonl",
+    "num_prompts": 256,
+    "request_rate": 100,
+    "max_concurrency": 64,
+    "seed": 0,
+    "trace_chunk_size": 16,
+    "trace_sec_multiplier": 1,
+    "num_warmups": 0,
+    "ready_check_timeout_seconds": 0
+  }
+}

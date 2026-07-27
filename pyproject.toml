@@ -17,6 +17,12 @@ dependencies = [
     "uvicorn[standard]>=0.29,<1",
 ]
 
+[project.optional-dependencies]
+runtime = [
+    "lmcache==0.5.2",
+    "vllm==0.26.0",
+]
+
 [project.scripts]
 kareserve-server = "kareserve.cli:main"
 

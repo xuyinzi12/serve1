@@ -15,6 +15,8 @@ NUM_PROMPTS=${KARESERVE_NUM_PROMPTS:-128}
 REQUEST_RATE=${KARESERVE_REQUEST_RATE:-20}
 MAX_CONCURRENCY=${KARESERVE_MAX_CONCURRENCY:-64}
 SEED=${KARESERVE_SEED:-0}
+READY_CHECK_TIMEOUT=${KARESERVE_READY_CHECK_TIMEOUT_SECONDS:-0}
+NUM_WARMUPS=${KARESERVE_NUM_WARMUPS:-0}
 RESULT_DIR=${KARESERVE_RESULT_DIR:-"$ROOT/runtime/benchmarks"}
 BENCH_LABEL=${KARESERVE_BENCH_LABEL:-windowed-prefix}
 RESULT_FILENAME=${KARESERVE_RESULT_FILENAME:-"${BENCH_LABEL}-${DATASET_NAME}.json"}
@@ -31,6 +33,8 @@ args=(
   --request-rate "$REQUEST_RATE"
   --max-concurrency "$MAX_CONCURRENCY"
   --seed "$SEED"
+  --ready-check-timeout-sec "$READY_CHECK_TIMEOUT"
+  --num-warmups "$NUM_WARMUPS"
   --save-result
   --result-dir "$RESULT_DIR"
   --result-filename "$RESULT_FILENAME"
@@ -51,6 +55,13 @@ case "$DATASET_NAME" in
       exit 2
     fi
     args+=(--dataset-path "$DATASET_PATH")
+    if [[ "$DATASET_NAME" == "timed_trace" ]]; then
+      args+=(
+        --self-timed
+        --timed-trace-chunk-hash-size "${KARESERVE_TRACE_CHUNK_SIZE:-16}"
+        --timed-trace-sec-multiplier "${KARESERVE_TRACE_SEC_MULTIPLIER:-1}"
+      )
+    fi
     ;;
   random)
     args+=(
@@ -73,4 +84,5 @@ if [[ "${KARESERVE_BENCH_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 mkdir -p "$RESULT_DIR"
+export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 exec "$ENV/bin/vllm" "${args[@]}"

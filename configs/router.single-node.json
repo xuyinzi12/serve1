@@ -7,6 +7,7 @@
       "kv_events_endpoint": "tcp://127.0.0.1:5558"
     }
   ],
+  "tokenizer_node_id": "prefill-node-gpu1",
   "routing": {
     "policy": "windowed_prefix",
     "window_ms": 2.0,
