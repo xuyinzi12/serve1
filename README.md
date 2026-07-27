@@ -7,14 +7,13 @@ KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router �
 ```text
 kareserve/          Router核心代码
 configs/            通用、单节点和双实例配置
-examples/           请求载荷与模型模板
 scripts/debug/      本地服务启动、停止和LMCache探测
 scripts/env/        独立运行环境安装与检查
-scripts/benchmark/  硬件测速
-docs/               当前架构与多实体演进说明
+scripts/benchmark/  硬件测速与工作负载Benchmark
+docs/               架构与实验说明
 ```
 
-`configs/config.example.json` 提供通用配置字段；`configs/single-node.gpu1.json` 保存当前 GPU1实测配置；`configs/dual-instance.gpu0-gpu1.json` 提供双实例模板。完整架构与多实体方向见 [docs/architecture.md](docs/architecture.md)。
+`configs/router.example.json`提供通用配置字段；`configs/router.single-node.json`保存当前单节点实测配置；`configs/router.two-node.json`提供双节点模板。完整架构与多实体方向见[架构文档](docs/architecture.md)，启动、模型、数据集和对比实验见[实验文档](docs/experiments.md)。
 
 ## 请求链路
 
@@ -118,14 +117,15 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 cd /home/zn/xyz/serve1
 GPU_IDS=1 bash scripts/debug/start_vllm_cluster.sh
 
-KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/configs/single-node.gpu1.json \
-  bash scripts/debug/start_router.sh
+GPU_IDS=1 bash scripts/debug/start_stack.sh
 ```
 
-双实例启动需要确认两张 GPU 均为空闲：
+双实例启动需要确认两张 GPU均为空闲：
 
 ```bash
-GPU_IDS="0 1" bash scripts/debug/start_vllm_cluster.sh
+KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/configs/router.two-node.json \
+GPU_IDS="0 1" \
+bash scripts/debug/start_stack.sh
 ```
 
 停止项目启动的全部调试进程：
@@ -141,19 +141,11 @@ bash scripts/debug/stop_debug_cluster.sh
 Router 接口兼容 `vllm bench serve` 的 Chat Completions 和 Completions 请求。Prefix 基础测试示例：
 
 ```bash
-.venv-vllm-0.26/bin/vllm bench serve \
-  --backend openai-chat \
-  --base-url http://127.0.0.1:8090 \
-  --endpoint /v1/chat/completions \
-  --model kareserve-opt-1.3b \
-  --tokenizer /home/zn/llm_models/opt-1.3b \
-  --dataset-name prefix_repetition \
-  --num-prompts 32 \
-  --prefix-repetition-prefix-len 512 \
-  --prefix-repetition-suffix-len 64 \
-  --prefix-repetition-num-prefixes 4 \
-  --prefix-repetition-output-len 16 \
-  --request-rate 20
+KARESERVE_DATASET_NAME=prefix_repetition \
+KARESERVE_PREFIX_LEN=512 \
+KARESERVE_NUM_PROMPTS=128 \
+KARESERVE_REQUEST_RATE=20 \
+bash scripts/benchmark/run_vllm_benchmark.sh
 ```
 
 正式策略对比需要复用相同模型、seed、请求轨迹和冷缓存启动流程。Round Robin、Prefix Hash、Window=0 和 Windowed Prefix 分别运行并独立保存结果。

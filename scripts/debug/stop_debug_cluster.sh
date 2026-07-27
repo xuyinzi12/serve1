@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/zn/xyz/serve1
+ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 RUNTIME="$ROOT/runtime"
 
 for pid_file in "$RUNTIME"/pids/*.pid; do

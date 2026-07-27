@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/zn/xyz/serve1
+ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 RUNTIME="$ROOT/runtime"
 ENV="$ROOT/.venv-vllm-0.26"
-CONFIG_PATH=${KARESERVE_CONFIG_PATH:-"$ROOT/configs/single-node.gpu1.json"}
+CONFIG_PATH=${KARESERVE_CONFIG_PATH:-"$ROOT/configs/router.single-node.json"}
 
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids"
 

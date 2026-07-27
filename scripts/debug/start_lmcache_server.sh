@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/zn/xyz/serve1
+ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 RUNTIME="$ROOT/runtime"
 ENV=${LMCACHE_ENV:-"$ROOT/.venv-vllm-0.26-lmcache"}
 HOST=${LMCACHE_HOST:-127.0.0.1}

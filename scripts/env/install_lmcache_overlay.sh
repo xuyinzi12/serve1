@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/zn/xyz/serve1
+ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 UV=${UV_BIN:-/home/zn/.local/bin/uv}
 BASE_ENV=${BASE_VLLM_ENV:-"$ROOT/.venv-vllm-0.26"}
 LMCACHE_ENV=${LMCACHE_ENV:-"$ROOT/.venv-vllm-0.26-lmcache"}

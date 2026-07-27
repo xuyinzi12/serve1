@@ -1,7 +1,0 @@
-{
-  "model": "kareserve-opt-1.3b",
-  "prompt": "Prefix cache routing",
-  "max_tokens": 8,
-  "temperature": 0,
-  "stream": false
-}

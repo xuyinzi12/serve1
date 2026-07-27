@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root=/home/zn/xyz/serve1
+root=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 target_env="$root/.venv-vllm-0.26"
 uv_bin=/home/zn/.local/bin/uv
 index_url=${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}

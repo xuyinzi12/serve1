@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/home/zn/xyz/serve1
+ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
 RUNTIME="$ROOT/runtime"
 ENV=${VLLM_ENV:-"$ROOT/.venv-vllm-0.26"}
 CUDA_HOME=${VLLM_CUDA_HOME:-"$ENV/lib/python3.12/site-packages/nvidia/cu13"}
 if [[ ! -d "$CUDA_HOME" ]]; then
   CUDA_HOME="$ROOT/.venv-vllm-0.26/lib/python3.12/site-packages/nvidia/cu13"
 fi
-MODEL=/home/zn/llm_models/opt-1.3b
-MODEL_NAME=kareserve-opt-1.3b
+MODEL=${KARESERVE_MODEL:-/home/zn/llm_models/opt-1.3b}
+MODEL_NAME=${KARESERVE_MODEL_NAME:-kareserve-opt-1.3b}
+DTYPE=${KARESERVE_DTYPE:-half}
+GPU_MEMORY_UTILIZATION=${KARESERVE_GPU_MEMORY_UTILIZATION:-0.5}
+CHAT_TEMPLATE=${KARESERVE_CHAT_TEMPLATE-"$ROOT/configs/chat_templates/opt.jinja"}
 
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids"
 
@@ -19,6 +22,7 @@ start_vllm() {
   local event_port="$3"
   local name="$4"
   local -a kv_args=()
+  local -a chat_args=()
 
   if [[ "${KARESERVE_LMCACHE_MP:-0}" == "1" ]]; then
     kv_args=(
@@ -26,6 +30,9 @@ start_vllm() {
       --kv-offloading-backend lmcache
       --disable-hybrid-kv-cache-manager
     )
+  fi
+  if [[ -n "$CHAT_TEMPLATE" ]]; then
+    chat_args=(--chat-template "$CHAT_TEMPLATE")
   fi
 
   if [[ -f "$RUNTIME/pids/$name.pid" ]] &&
@@ -44,10 +51,10 @@ start_vllm() {
     --served-model-name "$MODEL_NAME" \
     --host 127.0.0.1 \
     --port "$http_port" \
-    --dtype half \
-    --gpu-memory-utilization 0.5 \
+    --dtype "$DTYPE" \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
     --enable-prefix-caching \
-    --chat-template "$ROOT/examples/opt_chat_template.jinja" \
+    "${chat_args[@]}" \
     "${kv_args[@]}" \
     --kv-events-config \
     "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:$event_port\"}" \
