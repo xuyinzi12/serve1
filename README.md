@@ -138,8 +138,8 @@ GPU_IDS=1 \
 bash scripts/debug/start_vllm_cluster.sh
 ```
 
-LMCache Server 默认监听 `127.0.0.1:5555`，CPU L1 缓存容量为 2 GiB，淘汰策略为 LRU。LMCache 自身 observability 在调试配置中关闭，vLLM external prefix cache metrics 保持启用。vLLM 使用 `LMCacheMPConnector`、`kv_both` 角色和非 Hybrid KV Cache Manager。单 GPU 测试通过保持 LMCache Server 运行并顺序重启 vLLM，验证外部 KVCache 的 Store、Lookup 和 Retrieve。`scripts/debug/lmcache_probe.py` 提供确定性长 Prefix 请求和缓存指标输出。跨 GPU 并发共享需要两张空闲 GPU。
+LMCache Server 默认监听 `127.0.0.1:5555`，CPU L1 缓存容量为 2 GiB，淘汰策略为 LRU。LMCache 自身 observability 在调试配置中关闭，vLLM external prefix cache metrics 保持启用。vLLM 使用 `LMCacheMPConnector`、`kv_both` 角色和非 Hybrid KV Cache Manager。单 GPU 测试通过保持 LMCache Server 运行并顺序重启 vLLM，验证外部 KVCache 的 Store、Lookup 和 Retrieve。`scripts/debug/lmcache_probe.py` 提供确定性长 Prefix 请求和缓存指标输出。KaReserve 从各 vLLM `/metrics` 读取 LMCache 查询量和命中量，并通过 `/routing/state` 输出累计命中率。跨 GPU 并发共享需要两张空闲 GPU。
 
 ## 项目边界
 
-KaReserve 管理请求窗口、Prefix 分组、实例选择和 HTTP 转发。vLLM 管理执行批次和 GPU KVCache。LMCache 通过 vLLM KV Connector 管理外部 KVCache，LMCache MP Server 的跨实例共享需要独立安装与验证。
+KaReserve 管理请求窗口、Prefix 分组、实例选择和 HTTP 转发。vLLM 管理执行批次和 GPU KVCache。LMCache 通过 vLLM KV Connector 管理外部 KVCache。LMCache MP Server 的 HTTP API 提供对象管理和 warm prefetch，warm prefetch 会把 L2 对象加载到 L1。vLLM 连接器内部的 Lookup 管理实际请求的命中查询、会话和缓存读锁。KaReserve 当前使用 vLLM 本地 KV 事件完成 GPU Prefix 感知，并使用 vLLM 累计指标观测外部缓存效果。KaReserve 当前缺少面向单请求的 LMCache 全局只读 Lookup 接口。

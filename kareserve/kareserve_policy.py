@@ -36,6 +36,8 @@ class NodeState:
     running_requests: int = 0
     waiting_requests: int = 0
     kv_cache_usage: float = 0.0
+    external_cache_queries: float = 0.0
+    external_cache_hits: float = 0.0
     gpu_free_blocks: int = 1000
     cached_prefix_hashes: Set[str] = field(default_factory=set)
     cached_blocks: Dict[bytes | int | str, CachedBlock] = field(
@@ -50,6 +52,12 @@ class NodeState:
     def observed_load(self) -> float:
         metrics_load = self.running_requests + self.waiting_requests
         return max(float(self.active_requests), float(metrics_load))
+
+    @property
+    def external_cache_hit_rate(self) -> float:
+        if self.external_cache_queries <= 0:
+            return 0.0
+        return self.external_cache_hits / self.external_cache_queries
 
     def longest_cached_prefix_tokens(self, prompt_tokens: List[int]) -> int:
         if not prompt_tokens:

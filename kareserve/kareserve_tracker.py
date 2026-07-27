@@ -146,6 +146,10 @@ class KareserveTracker:
             "running_requests": "vllm:num_requests_running",
             "waiting_requests": "vllm:num_requests_waiting",
             "kv_cache_usage": "vllm:kv_cache_usage_perc",
+            "external_cache_queries": (
+                "vllm:external_prefix_cache_queries_total"
+            ),
+            "external_cache_hits": "vllm:external_prefix_cache_hits_total",
         }
         values: Dict[str, float] = {}
         for field, metric in names.items():

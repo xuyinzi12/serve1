@@ -406,6 +406,9 @@ async def routing_state():
                 "running_requests": node.running_requests,
                 "waiting_requests": node.waiting_requests,
                 "kv_cache_usage": node.kv_cache_usage,
+                "external_cache_queries": node.external_cache_queries,
+                "external_cache_hits": node.external_cache_hits,
+                "external_cache_hit_rate": node.external_cache_hit_rate,
                 "cached_blocks": len(node.cached_blocks),
             }
             for node_id, node in states.items()
