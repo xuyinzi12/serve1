@@ -1,0 +1,18 @@
+{
+  "nodes": [
+    {
+      "node_id": "prefill-node-gpu1",
+      "host": "127.0.0.1",
+      "port": 8102,
+      "kv_events_endpoint": "tcp://127.0.0.1:5558"
+    }
+  ],
+  "routing": {
+    "window_ms": 2.0,
+    "max_batch_size": 64,
+    "metrics_interval_seconds": 0.5,
+    "prefix_tokens_per_load_unit": 256.0,
+    "queue_weight": 1.0,
+    "group_block_size": 16
+  }
+}

@@ -36,5 +36,13 @@ start_vllm() {
   echo "started $name pid=$!"
 }
 
-start_vllm 0 8101 5557 vllm-gpu0
-start_vllm 1 8102 5558 vllm-gpu1
+for gpu in ${GPU_IDS:-0 1}; do
+  case "$gpu" in
+    0) start_vllm 0 8101 5557 vllm-gpu0 ;;
+    1) start_vllm 1 8102 5558 vllm-gpu1 ;;
+    *)
+      echo "unsupported debug GPU: $gpu" >&2
+      exit 2
+      ;;
+  esac
+done

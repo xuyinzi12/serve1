@@ -71,6 +71,50 @@ if HAS_VLLM_EVENT_DEPS:
         events: List[RawEvent]
         data_parallel_rank: int | None = None
 
+    class RawMapBlockStored(
+        msgspec.Struct,
+        tag="BlockStored",
+        omit_defaults=True,
+    ):
+        block_hashes: List[WireBlockHash]
+        parent_block_hash: WireBlockHash | None
+        token_ids: List[int]
+        block_size: int
+        lora_id: int | None = None
+        medium: str | None = None
+        lora_name: str | None = None
+        extra_keys: List[Any] | None = None
+        group_idx: int | None = None
+        kv_cache_spec_kind: str | None = None
+        kv_cache_spec_sliding_window: int | None = None
+        locality: str | None = None
+
+    class RawMapBlockRemoved(
+        msgspec.Struct,
+        tag="BlockRemoved",
+        omit_defaults=True,
+    ):
+        block_hashes: List[WireBlockHash]
+        medium: str | None
+        group_idx: int | None = None
+        locality: str | None = None
+
+    class RawMapAllBlocksCleared(
+        msgspec.Struct,
+        tag="AllBlocksCleared",
+        omit_defaults=True,
+    ):
+        pass
+
+    RawMapEvent = (
+        RawMapBlockStored | RawMapBlockRemoved | RawMapAllBlocksCleared
+    )
+
+    class RawMapEventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
+        ts: float
+        events: List[RawMapEvent]
+        data_parallel_rank: int | None = None
+
 
 class KareserveTracker:
     def __init__(self, initial_nodes: List[NodeState]) -> None:
@@ -78,10 +122,13 @@ class KareserveTracker:
         self._lock = threading.Lock()
         self._running = False
         self._threads: List[threading.Thread] = []
-        self._decoder = (
-            msgspec.msgpack.Decoder(RawEventBatch)
+        self._decoders = (
+            (
+                msgspec.msgpack.Decoder(RawMapEventBatch),
+                msgspec.msgpack.Decoder(RawEventBatch),
+            )
             if HAS_VLLM_EVENT_DEPS
-            else None
+            else ()
         )
 
     def get_node_states(self) -> Dict[str, NodeState]:
@@ -156,8 +203,17 @@ class KareserveTracker:
 
     def process_raw_payload(self, node_id: str, payload_bytes: bytes) -> None:
         try:
-            if self._decoder is not None:
-                events = self._decoder.decode(payload_bytes).events
+            if self._decoders:
+                decode_error: Exception | None = None
+                for decoder in self._decoders:
+                    try:
+                        events = decoder.decode(payload_bytes).events
+                        break
+                    except Exception as exc:
+                        decode_error = exc
+                else:
+                    assert decode_error is not None
+                    raise decode_error
             else:
                 events = json.loads(payload_bytes.decode("utf-8")).get("events", [])
             with self._lock:
@@ -168,10 +224,18 @@ class KareserveTracker:
                     event_name = type(event).__name__
                     if isinstance(event, dict):
                         event_name = event.get("type", "")
-                    if event_name in {"RawAllBlocksCleared", "AllBlocksCleared"}:
+                    if event_name in {
+                        "RawAllBlocksCleared",
+                        "RawMapAllBlocksCleared",
+                        "AllBlocksCleared",
+                    }:
                         node.cached_blocks.clear()
                         node.cached_prefix_hashes.clear()
-                    elif event_name in {"RawBlockRemoved", "BlockRemoved"} or (
+                    elif event_name in {
+                        "RawBlockRemoved",
+                        "RawMapBlockRemoved",
+                        "BlockRemoved",
+                    } or (
                         isinstance(event, dict)
                         and "medium" in event
                         and "token_ids" not in event

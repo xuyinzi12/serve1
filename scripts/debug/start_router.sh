@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=/home/zn/xyz/serve1
 RUNTIME="$ROOT/runtime"
 ENV="$ROOT/.venv-vllm-0.26"
+CONFIG_PATH=${KARESERVE_CONFIG_PATH:-"$RUNTIME/config/kareserve.json"}
 
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids"
 
@@ -15,7 +16,7 @@ fi
 
 cd "$ROOT"
 nohup "$ENV/bin/python" -m kareserve.cli \
-  --config "$RUNTIME/config/kareserve.json" \
+  --config "$CONFIG_PATH" \
   --host 127.0.0.1 \
   --port 8090 \
   >"$RUNTIME/logs/kareserve.log" 2>&1 &
