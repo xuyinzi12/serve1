@@ -39,6 +39,16 @@ def build_policy(routing: Dict[str, Any]) -> KareserveBasePolicy:
             ),
             queue_weight=float(routing.get("queue_weight", 1.0)),
             group_block_size=int(routing.get("group_block_size", 16)),
+            kv_cache_weight=float(routing.get("kv_cache_weight", 2.0)),
+            kv_cache_high_watermark=float(
+                routing.get("kv_cache_high_watermark", 0.80)
+            ),
+            kv_cache_hard_limit=float(
+                routing.get("kv_cache_hard_limit", 0.95)
+            ),
+            decode_token_weight=float(
+                routing.get("decode_token_weight", 4.0)
+            ),
         )
     if policy_name == "round_robin":
         return RoundRobinPolicy()
@@ -100,7 +110,10 @@ async def poll_metrics() -> None:
                             tracker.update_metrics_text(
                                 node.node_id, await response.text()
                             )
+                        else:
+                            tracker.mark_metrics_unavailable(node.node_id)
                 except (aiohttp.ClientError, asyncio.TimeoutError):
+                    tracker.mark_metrics_unavailable(node.node_id)
                     logger.debug("Metrics unavailable for %s", node.node_id)
         await asyncio.sleep(interval)
 
@@ -241,6 +254,7 @@ def route_headers(
         "X-Kareserve-Batch-Size": str(batch_size),
         "X-Kareserve-Queue-Wait-Ms": f"{queue_wait_ms:.3f}",
         "X-Kareserve-Prefix-Hit-Tokens": str(prefix_hit_tokens),
+        "X-Kareserve-KV-Cache-Usage": f"{node.kv_cache_usage:.6f}",
     }
 
 
@@ -300,6 +314,9 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "queue_wait_ms": round(assignment.queue_wait_ms, 3),
                 "prompt_tokens": len(prompt_tokens),
                 "prefix_hit_tokens": prefix_hit_tokens,
+                "node_observed_load": selected_node.observed_load,
+                "node_kv_cache_usage": selected_node.kv_cache_usage,
+                "node_metrics_available": selected_node.metrics_available,
             },
             separators=(",", ":"),
         ),
@@ -399,6 +416,7 @@ async def routing_state():
     states = tracker.get_node_states()
     return {
         "policy": policy.name,
+        "hardware_profile": config.get("hardware_profile", {}),
         "nodes": {
             node_id: {
                 "endpoint": node.endpoint_url,
@@ -406,6 +424,8 @@ async def routing_state():
                 "running_requests": node.running_requests,
                 "waiting_requests": node.waiting_requests,
                 "kv_cache_usage": node.kv_cache_usage,
+                "metrics_available": node.metrics_available,
+                "metrics_updated_at": node.metrics_updated_at,
                 "external_cache_queries": node.external_cache_queries,
                 "external_cache_hits": node.external_cache_hits,
                 "external_cache_hit_rate": node.external_cache_hit_rate,

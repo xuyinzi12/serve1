@@ -33,7 +33,7 @@ Completion 响应包含目标实例、路由策略、窗口大小、Router 等�
 - `round_robin`：按照窗口到达顺序轮询实例。
 - `least_load`：按照实例负载和窗口内虚拟负载分配。
 - `prefix_hash`：将固定长度 Prefix 稳定映射到实例。
-- `windowed_prefix`：按共享 Prefix 分组，并联合考虑缓存命中与实例负载。
+- `windowed_prefix`：按共享 Prefix 形成逻辑请求组，并联合考虑 GPU 本地缓存命中、实例负载和 KVCache 容量压力。组内请求仍以独立 HTTP 请求转发，vLLM 负责实际执行批次。
 
 `routing.window_ms=0` 表示逐请求立即分配。正数窗口表示 Router 最多等待对应时间收集请求。`routing.max_batch_size` 会提前触发窗口处理。
 
@@ -46,10 +46,45 @@ Completion 响应包含目标实例、路由策略、窗口大小、Router 等�
     "prefix_hash_tokens": 256,
     "prefix_tokens_per_load_unit": 256.0,
     "queue_weight": 1.0,
+    "kv_cache_weight": 2.0,
+    "kv_cache_high_watermark": 0.8,
+    "kv_cache_hard_limit": 0.95,
+    "decode_token_weight": 4.0,
     "group_block_size": 16
   }
 }
 ```
+
+`windowed_prefix` 将 GPU 本地命中 token 换算为复用收益，将运行请求、等待请求和窗口内新增工作换算为负载代价。窗口内新增工作使用目标实例未命中的 Prompt token 和加权 Decode token 计算。`kv_cache_high_watermark` 以上的容量占用产生二次增长惩罚；存在低于 `kv_cache_hard_limit` 的实例时，高于该阈值的实例退出候选集；全部实例超过阈值时，Router 选择占用最低的实例。vLLM `/metrics` 拉取失败的实例在存在健康实例时退出候选集。
+
+所有实例连接同一个 LMCache MP Server 时，LMCache CPU 命中对实例排序构成共享条件。Router 使用 GPU 本地 Prefix 和实例负载完成选点，目标 vLLM Connector 执行 LMCache Lookup 和 Load。
+
+## 硬件测速
+
+CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本通过 CUDA Event 测量多个数据尺寸，并输出线性拟合带宽、固定延迟和各尺寸分位延迟：
+
+```bash
+.venv-vllm-0.26-lmcache/bin/python \
+  scripts/benchmark/measure_h2d_bandwidth.py \
+  --device 1 \
+  --sizes-mib 1,4,16,64 \
+  --warmup 10 \
+  --iterations 30
+```
+
+测速结果写入运行配置的 `hardware_profile`：
+
+```json
+{
+  "hardware_profile": {
+    "h2d_bandwidth_gbps": 0.0,
+    "h2d_base_latency_ms": 0.0,
+    "measurement": "scripts/benchmark/measure_h2d_bandwidth.py"
+  }
+}
+```
+
+当前路由策略输出该 Profile用于实验记录。共享 LMCache场景中的实例排序暂不使用 H2D参数。后续加入外部缓存请求级目录后，Router使用该 Profile估算 LMCache加载时间。
 
 ## 运行环境
 
@@ -142,4 +177,4 @@ LMCache Server 默认监听 `127.0.0.1:5555`，CPU L1 缓存容量为 2 GiB，�
 
 ## 项目边界
 
-KaReserve 管理请求窗口、Prefix 分组、实例选择和 HTTP 转发。vLLM 管理执行批次和 GPU KVCache。LMCache 通过 vLLM KV Connector 管理外部 KVCache。LMCache MP Server 的 HTTP API 提供对象管理和 warm prefetch，warm prefetch 会把 L2 对象加载到 L1。vLLM 连接器内部的 Lookup 管理实际请求的命中查询、会话和缓存读锁。KaReserve 当前使用 vLLM 本地 KV 事件完成 GPU Prefix 感知，并使用 vLLM 累计指标观测外部缓存效果。KaReserve 当前缺少面向单请求的 LMCache 全局只读 Lookup 接口。
+KaReserve 管理请求窗口、Prefix逻辑分组、GPU本地 Prefix感知、容量与负载感知选点和 HTTP转发。vLLM 管理执行批次和 GPU KVCache。LMCache通过 vLLM KV Connector管理共享 CPU KVCache。当前单机路由不执行 GPU间 KVCache传输，也不在转发前调用 LMCache Lookup。vLLM连接器负责实际请求的 LMCache命中查询、加载和缓存锁生命周期。

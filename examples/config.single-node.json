@@ -14,7 +14,19 @@
     "metrics_interval_seconds": 0.5,
     "prefix_tokens_per_load_unit": 256.0,
     "queue_weight": 1.0,
+    "kv_cache_weight": 2.0,
+    "kv_cache_high_watermark": 0.8,
+    "kv_cache_hard_limit": 0.95,
+    "decode_token_weight": 4.0,
     "group_block_size": 16,
     "prefix_hash_tokens": 256
+  },
+  "hardware_profile": {
+    "device_name": "NVIDIA A100-SXM4-40GB",
+    "h2d_bandwidth_gbps": 22.4,
+    "h2d_base_latency_ms": 0.046,
+    "measurement_device": 1,
+    "measurement_date": "2026-07-27",
+    "measurement": "scripts/benchmark/measure_h2d_bandwidth.py"
   }
 }

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import Any, Dict, List
 
 from kareserve.kareserve_policy import CachedBlock, NodeState
@@ -143,29 +144,41 @@ class KareserveTracker:
 
     def update_metrics_text(self, node_id: str, metrics_text: str) -> None:
         names = {
-            "running_requests": "vllm:num_requests_running",
-            "waiting_requests": "vllm:num_requests_waiting",
-            "kv_cache_usage": "vllm:kv_cache_usage_perc",
+            "running_requests": ("vllm:num_requests_running", sum),
+            "waiting_requests": ("vllm:num_requests_waiting", sum),
+            "kv_cache_usage": ("vllm:kv_cache_usage_perc", max),
             "external_cache_queries": (
-                "vllm:external_prefix_cache_queries_total"
+                "vllm:external_prefix_cache_queries_total",
+                sum,
             ),
-            "external_cache_hits": "vllm:external_prefix_cache_hits_total",
+            "external_cache_hits": (
+                "vllm:external_prefix_cache_hits_total",
+                sum,
+            ),
         }
         values: Dict[str, float] = {}
-        for field, metric in names.items():
+        for field, (metric, reducer) in names.items():
             matches = re.findall(
                 rf"^{re.escape(metric)}(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)$",
                 metrics_text,
                 re.MULTILINE,
             )
             if matches:
-                values[field] = sum(float(value) for value in matches)
+                values[field] = reducer(float(value) for value in matches)
         with self._lock:
             node = self.nodes.get(node_id)
             if node is None:
                 return
             for field, value in values.items():
                 setattr(node, field, value)
+            node.metrics_available = True
+            node.metrics_updated_at = time.time()
+
+    def mark_metrics_unavailable(self, node_id: str) -> None:
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if node is not None:
+                node.metrics_available = False
 
     @staticmethod
     def _event_value(event: Any, name: str, default: Any = None) -> Any:

@@ -20,7 +20,16 @@
     "metrics_interval_seconds": 0.5,
     "prefix_tokens_per_load_unit": 256.0,
     "queue_weight": 1.0,
+    "kv_cache_weight": 2.0,
+    "kv_cache_high_watermark": 0.8,
+    "kv_cache_hard_limit": 0.95,
+    "decode_token_weight": 4.0,
     "group_block_size": 16,
     "prefix_hash_tokens": 256
+  },
+  "hardware_profile": {
+    "h2d_bandwidth_gbps": 0.0,
+    "h2d_base_latency_ms": 0.0,
+    "measurement": "scripts/benchmark/measure_h2d_bandwidth.py"
   }
 }

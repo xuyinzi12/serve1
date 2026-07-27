@@ -38,6 +38,8 @@ class NodeState:
     kv_cache_usage: float = 0.0
     external_cache_queries: float = 0.0
     external_cache_hits: float = 0.0
+    metrics_available: bool = False
+    metrics_updated_at: float = 0.0
     gpu_free_blocks: int = 1000
     cached_prefix_hashes: Set[str] = field(default_factory=set)
     cached_blocks: Dict[bytes | int | str, CachedBlock] = field(
@@ -120,6 +122,12 @@ class KareserveBasePolicy(ABC):
         return self.select_node(request, cluster_nodes)
 
     @staticmethod
+    def available_nodes(cluster_nodes: Dict[str, NodeState]) -> List[NodeState]:
+        nodes = list(cluster_nodes.values())
+        available = [node for node in nodes if node.metrics_available]
+        return available or nodes
+
+    @staticmethod
     def request_work(request: SchedulerRequest) -> float:
         return max(1.0, len(request.prompt_tokens) / 256.0)
 
@@ -134,10 +142,60 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         prefix_tokens_per_load_unit: float = 256.0,
         queue_weight: float = 1.0,
         group_block_size: int = 16,
+        kv_cache_weight: float = 2.0,
+        kv_cache_high_watermark: float = 0.80,
+        kv_cache_hard_limit: float = 0.95,
+        decode_token_weight: float = 4.0,
     ) -> None:
         self.prefix_tokens_per_load_unit = prefix_tokens_per_load_unit
         self.queue_weight = queue_weight
         self.group_block_size = max(1, group_block_size)
+        self.kv_cache_weight = max(0.0, kv_cache_weight)
+        self.kv_cache_high_watermark = min(
+            max(kv_cache_high_watermark, 0.0), 1.0
+        )
+        self.kv_cache_hard_limit = min(
+            max(kv_cache_hard_limit, self.kv_cache_high_watermark), 1.0
+        )
+        self.decode_token_weight = max(0.0, decode_token_weight)
+
+    def _candidate_nodes(
+        self, cluster_nodes: Dict[str, NodeState]
+    ) -> List[NodeState]:
+        nodes = self.available_nodes(cluster_nodes)
+        below_limit = [
+            node for node in nodes if node.kv_cache_usage < self.kv_cache_hard_limit
+        ]
+        if below_limit:
+            return below_limit
+        if not nodes:
+            return []
+        minimum_usage = min(node.kv_cache_usage for node in nodes)
+        return [
+            node for node in nodes if node.kv_cache_usage == minimum_usage
+        ]
+
+    def _capacity_pressure(self, node: NodeState) -> float:
+        usage = min(max(node.kv_cache_usage, 0.0), 1.0)
+        if usage <= self.kv_cache_high_watermark:
+            return 0.0
+        remaining = max(1.0 - self.kv_cache_high_watermark, 1e-6)
+        normalized = (usage - self.kv_cache_high_watermark) / remaining
+        return self.kv_cache_weight * normalized * normalized
+
+    def _request_work_for_node(
+        self, request: SchedulerRequest, node: NodeState
+    ) -> float:
+        hit_tokens = node.longest_cached_prefix_tokens(request.prompt_tokens)
+        uncached_prompt_tokens = max(0, len(request.prompt_tokens) - hit_tokens)
+        weighted_tokens = (
+            uncached_prompt_tokens
+            + self.decode_token_weight * max(0, request.max_tokens)
+        )
+        return max(
+            1.0,
+            weighted_tokens / max(self.prefix_tokens_per_load_unit, 1.0),
+        )
 
     def _score(
         self,
@@ -147,7 +205,12 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
     ) -> float:
         hit_tokens = node.longest_cached_prefix_tokens(request.prompt_tokens)
         affinity = hit_tokens / max(self.prefix_tokens_per_load_unit, 1.0)
-        return affinity - self.queue_weight * load
+        projected_load = load + 0.5 * self._request_work_for_node(request, node)
+        return (
+            affinity
+            - self.queue_weight * projected_load
+            - self._capacity_pressure(node)
+        )
 
     def select_node_with_load(
         self,
@@ -155,10 +218,11 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         cluster_nodes: Dict[str, NodeState],
         virtual_load: Dict[str, float],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        candidates = self._candidate_nodes(cluster_nodes)
+        if not candidates:
             return None
         return max(
-            cluster_nodes.values(),
+            candidates,
             key=lambda node: self._score(
                 request, node, virtual_load.get(node.node_id, node.observed_load)
             ),
@@ -218,7 +282,8 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         requests: List[SchedulerRequest],
         cluster_nodes: Dict[str, NodeState],
     ) -> Dict[str, NodeState]:
-        if not cluster_nodes:
+        candidates = self._candidate_nodes(cluster_nodes)
+        if not candidates:
             return {}
         virtual_load = {
             node_id: node.observed_load for node_id, node in cluster_nodes.items()
@@ -226,7 +291,7 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         assignments: Dict[str, NodeState] = {}
         for group in self._shared_prefix_groups(requests):
             node = max(
-                cluster_nodes.values(),
+                candidates,
                 key=lambda candidate: (
                     sum(
                         candidate.longest_cached_prefix_tokens(
@@ -235,12 +300,23 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
                         for request in group
                     )
                     / max(self.prefix_tokens_per_load_unit, 1.0)
-                    - self.queue_weight * virtual_load[candidate.node_id]
+                    - self.queue_weight
+                    * (
+                        virtual_load[candidate.node_id]
+                        + 0.5
+                        * sum(
+                            self._request_work_for_node(request, candidate)
+                            for request in group
+                        )
+                    )
+                    - self._capacity_pressure(candidate)
                 ),
             )
             for request in group:
                 assignments[request.request_id] = node
-                virtual_load[node.node_id] += self.request_work(request)
+                virtual_load[node.node_id] += self._request_work_for_node(
+                    request, node
+                )
         return assignments
 
 
@@ -258,10 +334,11 @@ class ExampleTemplatePolicy(KareserveBasePolicy):
         request: SchedulerRequest,
         cluster_nodes: Dict[str, NodeState],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        nodes = self.available_nodes(cluster_nodes)
+        if not nodes:
             return None
         return max(
-            cluster_nodes.values(),
+            nodes,
             key=lambda node: (
                 self.weight_prefix
                 * (
@@ -285,9 +362,10 @@ class LeastLoadPolicy(KareserveBasePolicy):
         request: SchedulerRequest,
         cluster_nodes: Dict[str, NodeState],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        nodes = self.available_nodes(cluster_nodes)
+        if not nodes:
             return None
-        return min(cluster_nodes.values(), key=lambda node: node.observed_load)
+        return min(nodes, key=lambda node: node.observed_load)
 
     def select_node_with_load(
         self,
@@ -295,10 +373,11 @@ class LeastLoadPolicy(KareserveBasePolicy):
         cluster_nodes: Dict[str, NodeState],
         virtual_load: Dict[str, float],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        nodes = self.available_nodes(cluster_nodes)
+        if not nodes:
             return None
         return min(
-            cluster_nodes.values(),
+            nodes,
             key=lambda node: (
                 virtual_load.get(node.node_id, node.observed_load),
                 node.node_id,
@@ -336,9 +415,11 @@ class RoundRobinPolicy(KareserveBasePolicy):
         request: SchedulerRequest,
         cluster_nodes: Dict[str, NodeState],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        nodes = sorted(
+            self.available_nodes(cluster_nodes), key=lambda node: node.node_id
+        )
+        if not nodes:
             return None
-        nodes = sorted(cluster_nodes.values(), key=lambda node: node.node_id)
         node = nodes[self._next_index % len(nodes)]
         self._next_index += 1
         return node
@@ -369,9 +450,11 @@ class PrefixHashPolicy(KareserveBasePolicy):
         request: SchedulerRequest,
         cluster_nodes: Dict[str, NodeState],
     ) -> Optional[NodeState]:
-        if not cluster_nodes:
+        nodes = sorted(
+            self.available_nodes(cluster_nodes), key=lambda node: node.node_id
+        )
+        if not nodes:
             return None
-        nodes = sorted(cluster_nodes.values(), key=lambda node: node.node_id)
         prefix = request.prompt_tokens[: self.prefix_hash_tokens]
         key = ",".join(str(token) for token in prefix).encode("ascii")
         digest = hashlib.blake2b(key, digest_size=8).digest()
