@@ -109,6 +109,37 @@ Router 接口兼容 `vllm bench serve` 的 Chat Completions 和 Completions 请�
 
 正式策略对比需要复用相同模型、seed、请求轨迹和冷缓存启动流程。Round Robin、Prefix Hash、Window=0 和 Windowed Prefix 分别运行并独立保存结果。
 
+## LMCache MP
+
+LMCache 使用独立环境：
+
+```text
+/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache
+```
+
+该环境通过 `.pth` 只读引用基础 vLLM 0.26 环境，并单独安装 LMCache 0.5.2、SortedContainers 和 CuPy CUDA 13。基础环境中的 vLLM、Torch、CUDA、OpenTelemetry 和 Prometheus 版本不会发生变化。
+
+```bash
+bash scripts/env/install_lmcache_overlay.sh
+```
+
+启动独立 LMCache Server：
+
+```bash
+bash scripts/debug/start_lmcache_server.sh
+```
+
+启动连接 LMCache MP Server 的 vLLM：
+
+```bash
+VLLM_ENV=/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache \
+KARESERVE_LMCACHE_MP=1 \
+GPU_IDS=1 \
+bash scripts/debug/start_vllm_cluster.sh
+```
+
+LMCache Server 默认监听 `127.0.0.1:5555`，CPU L1 缓存容量为 2 GiB，淘汰策略为 LRU。LMCache 自身 observability 在调试配置中关闭，vLLM external prefix cache metrics 保持启用。vLLM 使用 `LMCacheMPConnector`、`kv_both` 角色和非 Hybrid KV Cache Manager。单 GPU 测试通过保持 LMCache Server 运行并顺序重启 vLLM，验证外部 KVCache 的 Store、Lookup 和 Retrieve。`scripts/debug/lmcache_probe.py` 提供确定性长 Prefix 请求和缓存指标输出。跨 GPU 并发共享需要两张空闲 GPU。
+
 ## 项目边界
 
 KaReserve 管理请求窗口、Prefix 分组、实例选择和 HTTP 转发。vLLM 管理执行批次和 GPU KVCache。LMCache 通过 vLLM KV Connector 管理外部 KVCache，LMCache MP Server 的跨实例共享需要独立安装与验证。

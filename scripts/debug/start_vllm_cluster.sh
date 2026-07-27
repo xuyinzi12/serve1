@@ -3,8 +3,11 @@ set -euo pipefail
 
 ROOT=/home/zn/xyz/serve1
 RUNTIME="$ROOT/runtime"
-ENV="$ROOT/.venv-vllm-0.26"
-CUDA_HOME="$ENV/lib/python3.12/site-packages/nvidia/cu13"
+ENV=${VLLM_ENV:-"$ROOT/.venv-vllm-0.26"}
+CUDA_HOME=${VLLM_CUDA_HOME:-"$ENV/lib/python3.12/site-packages/nvidia/cu13"}
+if [[ ! -d "$CUDA_HOME" ]]; then
+  CUDA_HOME="$ROOT/.venv-vllm-0.26/lib/python3.12/site-packages/nvidia/cu13"
+fi
 MODEL=/home/zn/llm_models/opt-1.3b
 MODEL_NAME=kareserve-opt-1.3b
 
@@ -15,6 +18,15 @@ start_vllm() {
   local http_port="$2"
   local event_port="$3"
   local name="$4"
+  local -a kv_args=()
+
+  if [[ "${KARESERVE_LMCACHE_MP:-0}" == "1" ]]; then
+    kv_args=(
+      --kv-offloading-size "${KARESERVE_LMCACHE_TRIGGER_GB:-1}"
+      --kv-offloading-backend lmcache
+      --disable-hybrid-kv-cache-manager
+    )
+  fi
 
   if [[ -f "$RUNTIME/pids/$name.pid" ]] &&
       kill -0 "$(cat "$RUNTIME/pids/$name.pid")" 2>/dev/null; then
@@ -22,13 +34,13 @@ start_vllm() {
     return
   fi
 
-  nohup env \
+  nohup env -u VLLM_ENV -u VLLM_CUDA_HOME \
     CUDA_VISIBLE_DEVICES="$gpu" \
     CUDA_HOME="$CUDA_HOME" \
     CUDACXX="$CUDA_HOME/bin/nvcc" \
     PATH="$CUDA_HOME/bin:$PATH" \
     VLLM_USE_FLASHINFER_SAMPLER=0 \
-    "$ENV/bin/vllm" serve "$MODEL" \
+    "$ENV/bin/python" -m vllm.entrypoints.cli.main serve "$MODEL" \
     --served-model-name "$MODEL_NAME" \
     --host 127.0.0.1 \
     --port "$http_port" \
@@ -36,6 +48,7 @@ start_vllm() {
     --gpu-memory-utilization 0.5 \
     --enable-prefix-caching \
     --chat-template "$ROOT/examples/opt_chat_template.jinja" \
+    "${kv_args[@]}" \
     --kv-events-config \
     "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:$event_port\"}" \
     >"$RUNTIME/logs/$name.log" 2>&1 &
