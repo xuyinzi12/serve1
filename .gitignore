@@ -8,6 +8,7 @@ kareserve/tests/
 benchmarks/results/
 results/
 logs/
+runtime/
 
 # Vendored reference source
 vllm/
@@ -20,6 +21,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv-*/
 dist/
 build/
 

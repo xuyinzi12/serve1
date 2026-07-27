@@ -1,0 +1,11 @@
+{
+  "model": "kareserve-opt-1.3b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Repeat the word cache."
+    }
+  ],
+  "max_tokens": 8,
+  "stream": true
+}

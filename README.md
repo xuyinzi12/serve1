@@ -1,68 +1,90 @@
 # KaReserve
 
-KaReserve 是部署在多个 vLLM 服务实例之前的窗口化 Prefix-aware Router。Router 在有限时间窗口内收集请求，按照公共 token Prefix 建立逻辑请求组，并结合各实例的 KVCache 状态与运行负载完成请求分配。
+KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，根据公共 Token Prefix、各实例的 KVCache 状态和运行负载完成实例分配，然后将请求转发给 vLLM 执行 Continuous Batching。
 
-## 系统边界
+## 目录结构
 
-KaReserve 调用 vLLM `/tokenize` 获取应用 Chat Template 后的 token IDs，调用 `/metrics` 获取实例负载，通过 ZMQ 订阅 vLLM KVCache events，通过 `/v1/chat/completions` 转发推理请求。vLLM Scheduler 管理 Continuous Batching 和 GPU KV blocks。LMCache 通过 vLLM KVConnector 管理外部 KVCache lookup 与 load。
+```text
+serve1/
+├── kareserve/                 Router 源码
+├── scripts/
+│   ├── env/                  环境安装与软件源检测
+│   └── debug/                双实例和 Router 联调脚本
+├── examples/                 请求样例与 OPT Chat Template
+├── runtime/                  服务器运行产物，不进入 Git
+│   ├── config/
+│   ├── logs/
+│   ├── pids/
+│   └── reports/
+├── .venv-vllm-0.26/          服务器独立运行环境，不进入 Git
+├── config.example.json
+└── pyproject.toml
+```
 
-## 安装
+## vLLM 0.26 环境
+
+服务器环境路径为：
+
+```text
+/home/zn/xyz/serve1/.venv-vllm-0.26
+```
+
+绝对路径调用能够明确选择版本：
 
 ```bash
-git clone <repository-url>
-cd kareserve
-python -m venv .venv
-source .venv/bin/activate
-pip install .
+/home/zn/xyz/serve1/.venv-vllm-0.26/bin/vllm --version
+/home/zn/xyz/serve1/.venv-vllm-0.26/bin/python --version
+```
+
+交互式操作可以激活环境：
+
+```bash
+cd /home/zn/xyz/serve1
+source .venv-vllm-0.26/bin/activate
+vllm --version
+python --version
+deactivate
+```
+
+激活只会修改当前 Shell 的命令搜索路径。新终端需要重新激活。现有 `/home/zn/vllm_advanced_env` 继续提供 vLLM 0.18.0。
+
+环境安装脚本支持重复执行：
+
+```bash
+bash scripts/env/install_vllm_026.sh
 ```
 
 ## 配置
 
 ```bash
-cp config.example.json config.json
+mkdir -p runtime/config runtime/logs runtime/pids runtime/reports
+cp config.example.json runtime/config/kareserve.json
 ```
 
-`group_block_size` 需要与 vLLM 的 Prefix Hash 粒度保持一致。每个 vLLM 实例需要暴露 OpenAI API、`/tokenize`、`/metrics` 和独立的 KV event endpoint。
+`group_block_size` 需要与 vLLM Prefix Cache 的 Block 粒度保持一致。每个 vLLM 实例需要提供 OpenAI API、`/tokenize`、`/metrics` 和独立的 KV Event Endpoint。
 
-vLLM 需要启用 Prefix Caching 和 KV event 发布。以下参数展示单节点事件配置：
+## 调试启动
+
+双 vLLM 实例使用 GPU 0 和 GPU 1：
 
 ```bash
-vllm serve <model> \
-  --enable-prefix-caching \
-  --kv-events-config \
-  '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557"}'
+bash scripts/debug/start_vllm_cluster.sh
 ```
 
-不同物理服务器可以使用相同监听端口。同一服务器上的多个 vLLM 实例需要使用不同端口。LMCache 按现有 vLLM KVConnector 部署方式配置。
-
-## 启动
+Router 使用端口 8090：
 
 ```bash
-kareserve-server --config config.json --host 0.0.0.0 --port 8080
+bash scripts/debug/start_router.sh
 ```
 
-客户端将 OpenAI Chat Completions 请求发送到：
+停止本项目启动的调试进程：
 
-```text
-http://<router-host>:8080/v1/chat/completions
+```bash
+bash scripts/debug/stop_debug_cluster.sh
 ```
 
-健康检查地址为：
+运行日志位于 `runtime/logs/`，PID 文件位于 `runtime/pids/`。请求样例位于 `examples/smoke_request.json`。
 
-```text
-http://<router-host>:8080/health
-```
+## 调度边界
 
-## 当前调度流程
-
-```text
-vLLM Tokenization
-→ 窗口请求聚合
-→ 公共 Prefix 分组
-→ KVCache 与实例负载查询
-→ 窗口内请求组分配
-→ 请求级 HTTP 转发
-→ vLLM Continuous Batching
-```
-
-当前版本实现 Prefill vLLM 实例选择。当前版本不包含 Prefill/Decode Pair 选择、Router 主动 KVCache 传输和 vLLM 内部执行 Batch 控制。
+KaReserve 负责请求窗口聚合、公共 Prefix 分组、KVCache 与负载感知的实例选择和 HTTP 转发。vLLM 负责 Continuous Batching、Paged KVCache 和模型执行。LMCache 通过兼容的 vLLM KVConnector 接入外部 KVCache 存储与加载。
