@@ -62,7 +62,7 @@ def build_policy(routing: Dict[str, Any]) -> KareserveBasePolicy:
 
 
 def load_config(
-    config_path: str = "kareserve/config.json",
+    config_path: str = "configs/single-node.gpu1.json",
 ) -> tuple[List[NodeState], KareserveBasePolicy, Dict[str, Any]]:
     path = Path(config_path)
     if not path.is_file():
@@ -84,7 +84,7 @@ def load_config(
 
 
 initial_nodes, policy, config = load_config(
-    os.environ.get("KARESERVE_CONFIG", "kareserve/config.json")
+    os.environ.get("KARESERVE_CONFIG", "configs/single-node.gpu1.json")
 )
 tracker = KareserveTracker(initial_nodes)
 routing_config = config.get("routing", {})

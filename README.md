@@ -2,6 +2,20 @@
 
 KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，根据公共 Token Prefix、各实例的本地 KVCache 和运行负载完成实例分配。vLLM 继续负责 Continuous Batching、Paged KVCache 和模型执行。
 
+## 项目目录
+
+```text
+kareserve/          Router核心代码
+configs/            通用、单节点和双实例配置
+examples/           请求载荷与模型模板
+scripts/debug/      本地服务启动、停止和LMCache探测
+scripts/env/        独立运行环境安装与检查
+scripts/benchmark/  硬件测速
+docs/               当前架构与多实体演进说明
+```
+
+`configs/config.example.json` 提供通用配置字段；`configs/single-node.gpu1.json` 保存当前 GPU1实测配置；`configs/dual-instance.gpu0-gpu1.json` 提供双实例模板。完整架构与多实体方向见 [docs/architecture.md](docs/architecture.md)。
+
 ## 请求链路
 
 ```text
@@ -104,7 +118,7 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 cd /home/zn/xyz/serve1
 GPU_IDS=1 bash scripts/debug/start_vllm_cluster.sh
 
-KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/examples/config.single-node.json \
+KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/configs/single-node.gpu1.json \
   bash scripts/debug/start_router.sh
 ```
 

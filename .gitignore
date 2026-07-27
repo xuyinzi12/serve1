@@ -1,14 +1,15 @@
 # Local configuration
-kareserve/config.json
 .env
 *.local.json
 
 # Local tests and experiment outputs
+tests/
 kareserve/tests/
 benchmarks/results/
 results/
 logs/
 runtime/
+*.bundle
 
 # Vendored reference source
 vllm/

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=/home/zn/xyz/serve1
 RUNTIME="$ROOT/runtime"
 ENV="$ROOT/.venv-vllm-0.26"
-CONFIG_PATH=${KARESERVE_CONFIG_PATH:-"$RUNTIME/config/kareserve.json"}
+CONFIG_PATH=${KARESERVE_CONFIG_PATH:-"$ROOT/configs/single-node.gpu1.json"}
 
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids"
 

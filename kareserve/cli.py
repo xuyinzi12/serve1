@@ -9,7 +9,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start the Kareserve router")
     parser.add_argument(
         "--config",
-        default="config.json",
+        required=True,
         help="Path to the Kareserve JSON configuration",
     )
     parser.add_argument("--host", default="0.0.0.0")
