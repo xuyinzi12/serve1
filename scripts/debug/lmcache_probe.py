@@ -33,8 +33,14 @@ def get_metrics(base_url: str) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8102")
+    parser.add_argument(
+        "--metrics-url",
+        default=None,
+        help="vLLM metrics base URL; defaults to --base-url",
+    )
     parser.add_argument("--phase", required=True)
     args = parser.parse_args()
+    metrics_url = args.metrics_url or args.base_url
 
     shared_prefix = (
         "LMCache shared prefix validation context contains deterministic "
@@ -63,7 +69,7 @@ def main() -> None:
                 "phase": args.phase,
                 "elapsed_ms": round(elapsed_ms, 3),
                 "completion_id": response_body.get("id"),
-                "metrics": get_metrics(args.base_url),
+                "metrics": get_metrics(metrics_url),
             },
             sort_keys=True,
         )
