@@ -8,7 +8,6 @@ KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router �
 kareserve/          Router核心代码
 configs/            通用、单节点和双实例配置
 scripts/debug/      本地服务启动、停止和LMCache探测
-scripts/env/        独立运行环境安装与检查
 scripts/benchmark/  硬件测速与工作负载Benchmark
 docs/               架构与实验说明
 ```
@@ -101,13 +100,16 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 
 ## 运行环境
 
-服务器独立环境位于：
+服务器保留两个运行环境：
 
 ```text
-/home/zn/xyz/serve1/.venv-vllm-0.26
+/home/zn/xyz/serve1/.venv-vllm-0.26          vLLM、Torch、CUDA和Benchmark
+/home/zn/xyz/serve1/.venv-vllm-0.26-lmcache  LMCache运行入口
 ```
 
-该环境与 `/home/zn/vllm_advanced_env` 隔离。源码通过工作目录直接加载，当前调试流程不要求安装 KaReserve wheel。
+LMCache 0.5.2涉及NumPy、OpenTelemetry和Prometheus依赖变更。Overlay环境保存LMCache专用依赖，并通过`.pth`读取基础环境中的vLLM、Torch和CUDA。该结构保持基础vLLM环境的依赖版本稳定。
+
+统一启动脚本根据`KARESERVE_ENABLE_LMCACHE`自动选择Python。默认值`1`使用Overlay环境，值`0`使用基础环境。日常启动无需激活环境。手工运行命令时可以直接使用对应环境的Python；交互式排查可以激活其中一个环境，同一Shell只需激活当前命令所需的环境。
 
 ## 调试启动
 
@@ -158,11 +160,7 @@ LMCache 使用独立环境：
 /home/zn/xyz/serve1/.venv-vllm-0.26-lmcache
 ```
 
-该环境通过 `.pth` 只读引用基础 vLLM 0.26 环境，并单独安装 LMCache 0.5.2、SortedContainers 和 CuPy CUDA 13。基础环境中的 vLLM、Torch、CUDA、OpenTelemetry 和 Prometheus 版本不会发生变化。
-
-```bash
-bash scripts/env/install_lmcache_overlay.sh
-```
+该环境通过 `.pth` 只读引用基础 vLLM 0.26 环境，并单独安装 LMCache 0.5.2、SortedContainers 和 CuPy CUDA 13。基础环境中的 vLLM、Torch、CUDA、OpenTelemetry 和 Prometheus 版本保持不变。
 
 启动独立 LMCache Server：
 

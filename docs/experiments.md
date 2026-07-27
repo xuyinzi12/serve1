@@ -9,7 +9,22 @@
 .venv-vllm-0.26-lmcache  LMCache Overlay，复用基础环境
 ```
 
-LMCache Overlay通过 `.pth`引用基础环境。两个目录承担不同依赖职责。
+LMCache 0.5.2涉及NumPy、OpenTelemetry和Prometheus依赖变更。LMCache Overlay通过`.pth`读取基础环境中的vLLM、Torch和CUDA，并保存LMCache专用依赖。统一启动脚本默认选择Overlay环境；`KARESERVE_ENABLE_LMCACHE=0`使启动脚本选择基础环境。日常运行无需执行`activate`。
+
+```bash
+# 默认启用LMCache并自动使用Overlay环境
+GPU_IDS=1 bash scripts/debug/start_stack.sh
+
+# 关闭LMCache并自动使用基础环境
+KARESERVE_ENABLE_LMCACHE=0 GPU_IDS=1 bash scripts/debug/start_stack.sh
+```
+
+手工运行工具时使用明确的Python路径：
+
+```bash
+.venv-vllm-0.26/bin/python -m vllm --help
+.venv-vllm-0.26-lmcache/bin/python -c "import vllm, lmcache"
+```
 
 ## 模型
 
