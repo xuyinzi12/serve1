@@ -150,9 +150,12 @@ def _install_bridge() -> Any:
         if engine is None:
             raise HTTPException(status_code=503, detail="LMCache is not initialized")
         timeout_seconds = body.timeout_ms / 1000.0
-        results = []
-        for query in body.queries:
-            results.append(await _lookup_query(engine, query, timeout_seconds))
+        results = await asyncio.gather(
+            *(
+                _lookup_query(engine, query, timeout_seconds)
+                for query in body.queries
+            )
+        )
         return {"source": "lmcache_authoritative_lookup", "results": results}
 
     @app.get("/kareserve/cache/status")

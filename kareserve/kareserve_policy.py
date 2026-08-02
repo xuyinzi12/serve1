@@ -29,7 +29,6 @@ class CostModel:
     cpu_load_weight: float = 0.25
     fs_load_weight: float = 2.0
     obj_load_weight: float = 4.0
-    unknown_load_weight: float = 1.0
     compute_ms_per_token: float | None = None
     kv_bytes_per_token: float | None = None
     medium_profiles: dict[str, dict[str, float]] | None = None
@@ -68,7 +67,6 @@ class CostModel:
             cpu_load_weight=float(profile.get("cpu_load_weight", 0.25)),
             fs_load_weight=float(profile.get("fs_load_weight", 2.0)),
             obj_load_weight=float(profile.get("obj_load_weight", 4.0)),
-            unknown_load_weight=float(profile.get("unknown_load_weight", 1.0)),
             compute_ms_per_token=compute_ms,
             kv_bytes_per_token=kv_bytes,
             medium_profiles=medium_profiles,
@@ -79,7 +77,7 @@ class CostModel:
             return max(0, tokens) * self.compute_ms_per_token
         return max(0, tokens) / self.tokens_per_work_unit
 
-    def _direct_load_cost(self, medium: CacheMedium, tokens: int) -> float:
+    def transfer_cost(self, medium: CacheMedium, tokens: int) -> float:
         tokens = max(0, tokens)
         profile = (self.medium_profiles or {}).get(medium.value)
         if profile and self.kv_bytes_per_token is not None:
@@ -93,48 +91,33 @@ class CostModel:
             CacheMedium.CPU: self.cpu_load_weight,
             CacheMedium.FS: self.fs_load_weight,
             CacheMedium.OBJ: self.obj_load_weight,
-            CacheMedium.UNKNOWN: self.unknown_load_weight,
         }
         return tokens * weights.get(medium, 0.0) / self.tokens_per_work_unit
-
-    def load_cost(self, medium: CacheMedium, tokens: int) -> float:
-        if medium is CacheMedium.FS:
-            return self._direct_load_cost(
-                CacheMedium.FS, tokens
-            ) + self._direct_load_cost(CacheMedium.CPU, tokens)
-        if medium is CacheMedium.OBJ:
-            return self._direct_load_cost(
-                CacheMedium.OBJ, tokens
-            ) + self._direct_load_cost(CacheMedium.CPU, tokens)
-        return self._direct_load_cost(medium, tokens)
 
     def candidate_work(
         self, request: SchedulerRequest, candidate: RouteCandidate
     ) -> float:
         match = candidate.prefix_match
-        external_options: list[tuple[CacheMedium, int]] = []
-        for medium, prefix_tokens in (
-            (CacheMedium.CPU, match.cpu_prefix_tokens),
-            (CacheMedium.FS, match.fs_prefix_tokens),
-            (CacheMedium.OBJ, match.obj_prefix_tokens),
-            (CacheMedium.UNKNOWN, match.unknown_prefix_tokens),
-        ):
-            if prefix_tokens > match.gpu_prefix_tokens:
-                external_options.append((medium, prefix_tokens))
-
-        if external_options:
-            longest_external = max(item[1] for item in external_options)
-            options = []
-            for medium, prefix_tokens in external_options:
-                if prefix_tokens != longest_external:
-                    continue
-                loaded_tokens = prefix_tokens - match.gpu_prefix_tokens
-                missing_tokens = max(0, match.prompt_tokens - prefix_tokens)
-                options.append(
-                    self.load_cost(medium, loaded_tokens)
-                    + self.compute_cost(missing_tokens)
-                )
-            prompt_cost = min(options)
+        external_prefix = match.external_prefix_tokens
+        if external_prefix > match.gpu_prefix_tokens:
+            gpu_load_tokens = external_prefix - match.gpu_prefix_tokens
+            prompt_cost = self.transfer_cost(
+                CacheMedium.CPU, gpu_load_tokens
+            )
+            l1_prefix = max(match.gpu_prefix_tokens, match.cpu_prefix_tokens)
+            if external_prefix > l1_prefix:
+                l2_options = [
+                    self.transfer_cost(medium, external_prefix - l1_prefix)
+                    for medium, prefix_tokens in (
+                        (CacheMedium.FS, match.fs_prefix_tokens),
+                        (CacheMedium.OBJ, match.obj_prefix_tokens),
+                    )
+                    if prefix_tokens == external_prefix
+                ]
+                prompt_cost += min(l2_options)
+            prompt_cost += self.compute_cost(
+                match.prompt_tokens - external_prefix
+            )
         else:
             prompt_cost = self.compute_cost(
                 match.prompt_tokens - match.gpu_prefix_tokens
@@ -413,9 +396,3 @@ class PrefixHashPolicy(KareserveBasePolicy):
             candidate = eligible[int.from_bytes(digest, "big") % len(eligible)]
             assignments[request.request_id] = self._assignment(request, candidate, 0.0)
         return assignments
-
-
-class KareserveMediumAwarePolicy(WindowedPrefixAffinityPolicy):
-    """Compatibility name for the medium-aware windowed policy."""
-
-    name = "medium_aware"

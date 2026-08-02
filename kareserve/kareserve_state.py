@@ -7,46 +7,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-BlockHash = bytes | int | str
-BlockIdentity = tuple[int, BlockHash]
-
 
 class CacheMedium(str, Enum):
-    GPU = "GPU"
     CPU = "CPU"
     FS = "FS"
     OBJ = "OBJ"
-    UNKNOWN = "UNKNOWN"
-
-    @classmethod
-    def parse(cls, value: Any) -> CacheMedium:
-        if value is None:
-            return cls.UNKNOWN
-        normalized = str(value).upper()
-        if normalized.startswith("CUDA"):
-            return cls.GPU
-        aliases = {"DISK": cls.FS, "REMOTE": cls.OBJ}
-        if normalized in aliases:
-            return aliases[normalized]
-        try:
-            return cls(normalized)
-        except ValueError:
-            return cls.UNKNOWN
-
-
-class CacheLocality(str, Enum):
-    LOCAL = "LOCAL"
-    REMOTE = "REMOTE"
-    UNKNOWN = "UNKNOWN"
-
-    @classmethod
-    def parse(cls, value: Any) -> CacheLocality:
-        if value is None:
-            return cls.UNKNOWN
-        try:
-            return cls(str(value).upper())
-        except ValueError:
-            return cls.UNKNOWN
 
 
 class MetricsStatus(str, Enum):
@@ -57,26 +22,6 @@ class MetricsStatus(str, Enum):
 class CatalogStatus(str, Enum):
     HEALTHY = "healthy"
     DEGRADED = "degraded"
-
-
-@dataclass(frozen=True, slots=True)
-class CachePlacement:
-    medium: CacheMedium
-    owner_id: str
-    locality: CacheLocality = CacheLocality.UNKNOWN
-
-
-@dataclass(slots=True)
-class CachedBlock:
-    block_hash: BlockHash
-    group_idx: int
-    parent_block_hash: BlockHash | None
-    token_ids: tuple[int, ...]
-    placements: set[CachePlacement] = field(default_factory=set)
-
-    @property
-    def identity(self) -> BlockIdentity:
-        return self.group_idx, self.block_hash
 
 
 @dataclass(slots=True)
@@ -97,8 +42,8 @@ class NodeState:
     metrics_status: MetricsStatus = MetricsStatus.UNAVAILABLE
     metrics_updated_at: float | None = None
     process_start_time_seconds: float | None = None
-    external_cache_queries: float = 0.0
-    external_cache_hits: float = 0.0
+    lmcache_queries: float = 0.0
+    lmcache_hits: float = 0.0
 
     @property
     def endpoint_url(self) -> str:
@@ -123,7 +68,8 @@ class NodeRoutingState:
     metrics_status: MetricsStatus
     metrics_updated_at: float | None
     process_start_time_seconds: float | None
-    catalog_status: CatalogStatus
+    gpu_catalog_status: CatalogStatus
+    lmcache_catalog_status: CatalogStatus
 
     @property
     def endpoint_url(self) -> str:
@@ -148,7 +94,6 @@ class PrefixMatch:
     cpu_prefix_tokens: int = 0
     fs_prefix_tokens: int = 0
     obj_prefix_tokens: int = 0
-    unknown_prefix_tokens: int = 0
 
     @property
     def external_prefix_tokens(self) -> int:
@@ -156,7 +101,6 @@ class PrefixMatch:
             self.cpu_prefix_tokens,
             self.fs_prefix_tokens,
             self.obj_prefix_tokens,
-            self.unknown_prefix_tokens,
         )
 
     @property

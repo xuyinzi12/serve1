@@ -1,113 +1,43 @@
-# KaReserve 架构
+# 系统架构
 
-## 当前系统
+## 组件边界
 
-KaReserve 运行在多个完整 vLLM 实例前方。每个 vLLM 实例同时执行 Prefill 和 Decode，并管理本实例 GPU KVCache。单机 LMCache MP Server提供共享 CPU KVCache。Router 管理请求聚合、Prefix逻辑分组、实例状态采集、窗口级选点和 HTTP转发。
+KaReserve位于客户端与完整vLLM实例之间。Router管理集群级选点，vLLM管理实例内部调度，LMCache管理GPU之外的KVCache。
 
-```text
-Benchmark / Client
-        ↓
-KaReserve Router
-  Request Pool
-  Prefix Grouper
-  KVCache Tracker
-  Windowed Policy
-        ↓
-完整 vLLM实例
-  Continuous Batching
-  GPU KVCache
-  LMCache Connector
-        ↓
-单机 LMCache MP Server
-  CPU KVCache
-```
+请求进入Router后，Tokenizer生成与vLLM一致的Token ID；Request Pool按时间上限或数量上限形成一个路由窗口；Tracker与LMCache Lookup生成请求到各节点的Prefix命中状态；Policy计算窗口内分配；Router按目标实例并发转发独立HTTP请求。vLLM随后执行Continuous Batching。
 
-Router在本地加载与vLLM一致的Tokenizer和Chat Template，并生成准确Token IDs。Router使用KV Event维护实例GPU Prefix目录，使用事件序号检测缺口，使用Replay端点补发发布端仍保留的事件。Router使用`/metrics`维护运行队列、KVCache容量、进程代次和外部缓存累计命中状态。vLLM进程代次变化会清除该实例的GPU目录，外部缓存域目录继续保留。
+窗口内的Prefix分组属于路由约束。共享Prefix的请求倾向于进入同一实例。该分组不等同于vLLM执行Batch，也不改变请求协议。
 
-`NodeState`保存完整可观测状态，`NodeRoutingState`只保存策略使用的请求无关决策特征，`PrefixMatch`保存当前请求在GPU和外部缓存中的连续命中长度。Router在分配时同时登记请求数量和预计在途工作量，并在响应结束后释放。
+## 状态来源
 
-Prefix组表示窗口内具有公共Token Prefix的一组请求。组内请求获得同一个目标实例，Router仍然逐请求转发，vLLM决定实际执行批次。当前实现不提供首次并发Miss合并，也不提供GPU间KVCache传输。
+GPU缓存目录来自vLLM KV Event。Tracker保存每个实例的Block链、Token序列和事件序号，Replay端点补齐Router断连期间仍被发布端保留的事件。vLLM进程代次变化会清空对应实例的GPU目录。
 
-Router在窗口分配前通过KaReserve LMCache桥接接口执行批量Prefix查询。桥接接口使用LMCache官方Token Hasher生成ObjectKey，直接读取主机内存L1对象状态，并通过L2 Adapter Lookup读取文件系统或对象存储状态。共享`cache_domain_id`的实例共享同一查询结果。查询状态反映调用时刻的Store、Evict和Clear结果。目标vLLM Connector继续负责缓存锁、实际Load和GPU Block写入，vLLM外部缓存指标记录执行结果。
+LMCache状态来自项目扩展的只读查询接口。查询接口使用LMCache的Token Hasher生成ObjectKey，直接检查主机内存对象状态，并通过L2 Adapter检查文件系统或对象存储。Router对一个窗口中的请求执行批量查询，相同`cache_domain_id`的vLLM实例共享查询结果。该结果表示查询时刻的缓存状态，目标vLLM Connector仍然执行最终Lookup和锁管理。
 
-`windowed_prefix`策略使用GPU直接复用成本、外部缓存加载成本、未命中计算成本、实例队列、Router在途工作和GPU容量压力完成窗口级选点。完整Hardware Profile提供H2D带宽和模型计算参数，缺失字段触发归一化成本模型。
+实例负载来自vLLM`/metrics`和Router本地在途记录。路由输入包含vLLM运行队列、等待队列、GPU KVCache使用率、Router已分配工作量和请求所需新增Block数。缺失指标保持未知状态，Policy不会把未知值解释为零负载或满负载。
 
-## 多实体架构
+## 路由代价
 
-多实体架构把每台物理主机视为一个独立缓存与执行实体。每个实体拥有独立 GPU、CPU内存和本地磁盘：
+每个节点的执行路径由GPU命中和LMCache连续命中共同决定。LMCache先锁定主机内存中的连续前缀，再从L2补齐后续Chunk。Policy分别计算L2到主机内存、主机内存到GPU和剩余Prefill成本，然后比较不同节点的总成本。没有外部命中的节点执行完整剩余Prefill。
 
 ```text
-实体 A
-  vLLM A
-  GPU KVCache A
-  LMCache A / CPU内存 A
-  Disk Cache A
-
-实体 B
-  vLLM B
-  GPU KVCache B
-  LMCache B / CPU内存 B
-  Disk Cache B
-
-Global Router
-  实体状态
-  全局 Prefix目录
-  路由代价模型
+request cost
+= prompt path cost
++ expected decode work
++ vLLM queue and Router inflight work
++ GPU KVCache capacity pressure
 ```
 
-多实体路由需要判断请求 Prefix位于哪个实体、位于该实体的哪个介质、目标实例需要等待多久。第一版多实体策略优先把请求路由到持有缓存的实体，避免跨实体搬运 KVCache。远端缓存传输作为后续独立能力。
+硬件Profile把KVCache字节数、介质带宽和固定延迟换算为毫秒。Profile缺少必要字段时，Policy使用归一化工作单位。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。
 
-### 全局 Prefix目录
+`windowed_prefix`先按公共Token Prefix形成逻辑组，再选择组内总代价最低的共同节点。`round_robin`、`least_load`和`prefix_hash`保留为实验基线。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
 
-每个实体在 KVCache Store、Evict 和 Clear时发布元数据事件。全局目录维护 `Prefix Chunk → 实体 → 介质 → 状态版本`映射。Router使用请求 Token IDs计算 Chunk Hash，并查询最长连续命中长度。
+## 一致性边界
 
-目录事件需要包含模型标识、Chunk Hash、Chunk Size、缓存介质、实体标识、对象大小、事件版本和时间戳。目录允许短暂陈旧，目标 vLLM与本地 LMCache执行最终命中校验。事件版本、心跳和 TTL负责清理失联实体与过期目录项。
+GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节点的GPU目录状态标记为`degraded`。LMCache查询失败时，对应缓存域标记为`degraded`，当前窗口按外部缓存Miss处理。Router状态接口分别输出GPU目录状态和LMCache目录状态。
 
-### 分层代价模型
+缓存查询与请求抵达vLLM之间存在时间差。LMCache可能在这段时间发生淘汰，vLLM Connector负责最终正确性。Router查询只用于成本估算，不持有跨组件缓存租约。
 
-每个实体维护独立 Hardware Profile：
+## 多主机部署
 
-```text
-GPU本地命中代价
-CPU内存到GPU带宽与固定延迟
-磁盘到CPU带宽与固定延迟
-节点间网络带宽与固定延迟
-vLLM排队状态
-GPU、CPU和磁盘容量压力
-```
-
-Router 对请求和实体计算：
-
-```text
-预计完成代价
-= 实例排队时间
-+ 命中介质加载时间
-+ 未命中 Prefix计算时间
-+ 容量压力惩罚
-```
-
-共享 Prefix组使用组内总命中收益与目标实体新增工作量完成联合选点。所有实体均为冷 Miss时，策略按照负载和容量分散请求。该启发式策略构成多实体基线，后续优化器使用同一状态与代价接口。
-
-### 每实体 LMCache
-
-每台主机运行独立 LMCache服务。主机内存构成本机快速外部缓存，本地磁盘构成本机容量层。每个服务公开KaReserve只读Prefix查询接口，Router按照`cache_domain_id`并发查询各实体。多实体配置通过独立`cache_domains`端点表达缓存所有权。
-
-目标请求到达实体后，本地 vLLM Connector负责 Lookup、缓存锁、CPU或磁盘加载和GPU Block写入。Router负责选择实体与估算代价，执行层负责最终数据正确性。
-
-### 状态与故障处理
-
-实体状态需要包含 HTTP健康、指标更新时间、运行队列、GPU KVCache占用、CPU缓存占用、磁盘缓存占用和传输队列。Router对失联实体停止新分配，并保留短期状态用于恢复。请求转发失败需要记录失败阶段；尚未进入模型执行的请求可以选择其他实体重新分配。
-
-### 验证路径
-
-多实体实验依次验证单实体 GPU命中、单实体 CPU命中、单实体磁盘命中、双实体缓存位置路由、实体失联恢复和网络受限场景。各策略复用同一请求轨迹、模型、缓存初始状态和并发参数。核心指标包含 TTFT、吞吐量、Prefix命中层级、加载字节、路由等待、跨实体流量和尾部延迟。
-
-## 演进顺序
-
-1. 为每个实体建立独立配置、健康状态和 Hardware Profile。
-2. 部署每实体 LMCache CPU缓存与磁盘缓存。
-3. 建立全局 Prefix目录和 Store、Evict、Clear事件协议。
-4. 接入 CPU、磁盘和网络加载代价。
-5. 实现实体级容量控制、故障摘除和安全重试。
-6. 建立多实体 Benchmark与策略基线。
-7. 评估远端缓存传输和 Prefill/Decode分离。
+每台物理主机运行本地vLLM和LMCache服务，并拥有独立GPU、主机内存和文件系统。Router配置使用一个`cache_domain_id`关联共享同一LMCache的vLLM实例，使用`cache_domains.<id>.http_url`定位各主机的查询接口。Policy优先利用目标实体已经持有的缓存。当前数据面不提供跨主机GPU迁移，远端对象存储通过LMCache L2 Adapter进入成本模型。

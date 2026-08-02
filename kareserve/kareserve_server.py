@@ -44,7 +44,7 @@ class RouterConfig:
     tokenizer_trust_remote_code: bool = False
     chat_template_path: str | None = None
     allow_request_chat_template: bool = False
-    external_cache_enabled: bool = False
+    lmcache_enabled: bool = False
     cache_domains: dict[str, CacheDomainConfig] = field(default_factory=dict)
     lmcache_lookup_timeout_seconds: float = 1.0
     policy: str = "windowed_prefix"
@@ -125,8 +125,8 @@ def load_config(config_path: str) -> RouterConfig:
         node.get("cache_domain_id", node["node_id"]) for node in nodes
     }
     missing_domains = node_domains - cache_domains.keys()
-    external_cache_enabled = os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"
-    if external_cache_enabled and missing_domains:
+    lmcache_enabled = os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"
+    if lmcache_enabled and missing_domains:
         raise ValueError(
             "LMCache is enabled but cache_domains lacks: "
             + ", ".join(sorted(missing_domains))
@@ -142,7 +142,7 @@ def load_config(config_path: str) -> RouterConfig:
         allow_request_chat_template=bool(
             tokenizer.get("allow_request_chat_template", False)
         ),
-        external_cache_enabled=external_cache_enabled,
+        lmcache_enabled=lmcache_enabled,
         cache_domains=cache_domains,
         lmcache_lookup_timeout_seconds=max(
             0.01, float(routing.get("lmcache_lookup_timeout_seconds", 1.0))
@@ -177,7 +177,7 @@ def build_policy(config: RouterConfig) -> KareserveBasePolicy:
         decode_token_weight=config.decode_token_weight,
     )
     policy_name = config.policy.lower()
-    if policy_name in {"windowed_prefix", "medium_aware"}:
+    if policy_name == "windowed_prefix":
         return WindowedPrefixAffinityPolicy(
             cost_model=cost_model,
             queue_weight=config.queue_weight,
@@ -238,7 +238,7 @@ async def lifespan(app: FastAPI):
     tracker = KareserveTracker(initial_nodes)
     policy = build_policy(config)
     lmcache_lookup = None
-    if config.external_cache_enabled:
+    if config.lmcache_enabled:
         lmcache_lookup = LMCacheLookupClient(
             config.cache_domains,
             timeout_seconds=config.lmcache_lookup_timeout_seconds,
@@ -413,7 +413,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
             "max_completion_tokens", config.expected_output_tokens
         )
     scheduler_request = SchedulerRequest(
-        request_id=request_id,
+        request_id=f"route-{uuid.uuid4().hex}",
         prompt_tokens=prompt_tokens,
         max_tokens=max(0, int(configured_output)),
         raw_body=body,
@@ -448,7 +448,8 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "estimated_cost": assignment.estimated_cost,
                 "kv_cache_usage": node.kv_cache_usage,
                 "metrics_status": node.metrics_status.value,
-                "catalog_status": node.catalog_status.value,
+                "gpu_catalog_status": node.gpu_catalog_status.value,
+                "lmcache_catalog_status": node.lmcache_catalog_status.value,
             },
             separators=(",", ":"),
         ),
@@ -540,21 +541,21 @@ async def routing_state(request: Request):
                 "metrics_status": node.metrics_status.value,
                 "metrics_updated_at": node.metrics_updated_at,
                 "process_start_time_seconds": node.process_start_time_seconds,
-                "catalog_status": node.catalog_status.value,
+                "gpu_catalog_status": node.gpu_catalog_status.value,
+                "lmcache_catalog_status": node.lmcache_catalog_status.value,
             }
             for node_id, node in states.items()
         },
-        "cache_catalog": {
-            "blocks": len(tracker.cached_blocks),
-            "placements": sum(
-                len(block.placements) for block in tracker.cached_blocks.values()
-            ),
-            "external_source": (
+        "gpu_catalog": {
+            "blocks": tracker.gpu_cached_block_count,
+        },
+        "lmcache": {
+            "source": (
                 "lmcache_authoritative_lookup"
-                if config.external_cache_enabled
+                if config.lmcache_enabled
                 else "disabled"
             ),
-            "external_lookup": (
+            "lookup": (
                 request.app.state.lmcache_lookup.stats()
                 if request.app.state.lmcache_lookup is not None
                 else None
@@ -562,8 +563,8 @@ async def routing_state(request: Request):
         },
         "monitoring": {
             node_id: {
-                "external_cache_queries": tracker.nodes[node_id].external_cache_queries,
-                "external_cache_hits": tracker.nodes[node_id].external_cache_hits,
+                "lmcache_queries": tracker.nodes[node_id].lmcache_queries,
+                "lmcache_hits": tracker.nodes[node_id].lmcache_hits,
             }
             for node_id in states
         },

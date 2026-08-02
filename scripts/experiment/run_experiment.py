@@ -7,6 +7,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import shutil
 import subprocess
 import time
 import urllib.request
@@ -20,6 +21,19 @@ ROOT = Path(__file__).resolve().parents[2]
 def resolve_path(value: str) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+
+
+def resolve_lmcache_l2_path(runtime: dict[str, Any]) -> Path:
+    configured_path = runtime.get("lmcache_l2_path", "runtime/lmcache/l2")
+    l2_path = resolve_path(configured_path)
+    runtime_root = (ROOT / "runtime").resolve()
+    try:
+        l2_path.relative_to(runtime_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"LMCache L2 path must stay under {runtime_root}: {l2_path}"
+        ) from exc
+    return l2_path
 
 
 def run(command: list[str], env: dict[str, str], dry_run: bool) -> None:
@@ -139,6 +153,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ValueError(f"Dataset file does not exist: {dataset_path}")
     if not resolve_path(runtime["model"]).exists():
         raise ValueError(f"Model path does not exist: {runtime['model']}")
+    if runtime["enable_lmcache"] and runtime.get("reset_lmcache", True):
+        resolve_lmcache_l2_path(runtime)
 
 
 def read_router_state() -> dict[str, Any]:
@@ -146,6 +162,15 @@ def read_router_state() -> dict[str, Any]:
         "http://127.0.0.1:8090/routing/state", timeout=10
     ) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def reset_lmcache_storage(manifest: dict[str, Any]) -> None:
+    runtime = manifest["runtime"]
+    if not runtime["enable_lmcache"] or not runtime.get("reset_lmcache", True):
+        return
+    l2_path = resolve_lmcache_l2_path(runtime)
+    shutil.rmtree(l2_path, ignore_errors=True)
+    l2_path.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> None:
@@ -188,14 +213,18 @@ def main() -> None:
             env,
             args.dry_run,
         )
-        run(
-            ["bash", str(ROOT / "scripts/debug/start_stack.sh")],
-            env,
-            args.dry_run,
-        )
         if not args.dry_run:
-            time.sleep(float(manifest.get("settle_seconds", 2)))
+            reset_lmcache_storage(manifest)
+        stack_ready = False
         try:
+            run(
+                ["bash", str(ROOT / "scripts/debug/start_stack.sh")],
+                env,
+                args.dry_run,
+            )
+            stack_ready = True
+            if not args.dry_run:
+                time.sleep(float(manifest.get("settle_seconds", 2)))
             run(
                 ["bash", str(ROOT / "scripts/benchmark/run_vllm_benchmark.sh")],
                 env,
@@ -207,7 +236,7 @@ def main() -> None:
                     encoding="utf-8",
                 )
         finally:
-            if not args.leave_running:
+            if not args.leave_running or not stack_ready:
                 run(
                     ["bash", str(ROOT / "scripts/debug/stop_debug_cluster.sh")],
                     env,

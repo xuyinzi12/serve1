@@ -118,7 +118,7 @@ class RequestPool:
         external_matches = None
         if self.lmcache_lookup is not None:
             external_matches, failed_domains = await self.lmcache_lookup.lookup(requests)
-            self.tracker.set_external_lookup_status(failed_domains)
+            self.tracker.set_lmcache_lookup_status(failed_domains)
         candidates = self.tracker.build_route_candidates(
             requests, self.group_block_size, external_matches
         )

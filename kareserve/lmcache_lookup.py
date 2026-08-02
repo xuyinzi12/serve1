@@ -31,7 +31,7 @@ class LMCacheLookupClient:
         self.timeout_seconds = max(timeout_seconds, 0.01)
         self._session: aiohttp.ClientSession | None = None
         self.lookup_batches = 0
-        self.lookup_failures = 0
+        self.failed_domain_queries = 0
         self.last_errors: dict[str, str] = {}
 
     async def start(self) -> None:
@@ -147,7 +147,7 @@ class LMCacheLookupClient:
 
         await asyncio.gather(*(guarded(domain) for domain in self.domains.values()))
         self.lookup_batches += 1
-        self.lookup_failures += len(failed_domains)
+        self.failed_domain_queries += len(failed_domains)
         return results, failed_domains
 
     def stats(self) -> dict[str, Any]:
@@ -155,6 +155,6 @@ class LMCacheLookupClient:
             "source": "lmcache_authoritative_lookup",
             "domains": sorted(self.domains),
             "lookup_batches": self.lookup_batches,
-            "lookup_failures": self.lookup_failures,
+            "failed_domain_queries": self.failed_domain_queries,
             "last_errors": dict(self.last_errors),
         }

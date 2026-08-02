@@ -1,150 +1,81 @@
-# KaReserve 实验流程
+# 实验说明
 
-## 环境
+## 配置关系
 
-服务器使用一个项目环境：
+一次正式实验由一个Manifest描述。`runtime`指定GPU、模型和LMCache容量；`router_config`指定节点、缓存域、策略参数和硬件Profile；`benchmark`指定数据集、请求数量、到达率和并发；`router_overrides`用于策略与窗口消融。`scripts/experiment/run_experiment.py`把Manifest转换为各进程需要的环境变量，并保存解析后的完整运行记录。
 
-```text
-.venv-vllm-0.26  vLLM 0.26、Torch、CUDA、LMCache和Benchmark
-```
-
-LMCache开关改变vLLM Connector启动参数。所有实验使用相同Python环境。
-
-```bash
-# 默认启用LMCache
-GPU_IDS=1 bash scripts/debug/start_stack.sh
-
-# 关闭LMCache
-KARESERVE_ENABLE_LMCACHE=0 GPU_IDS=1 bash scripts/debug/start_stack.sh
-```
-
-手工运行工具时使用明确的Python路径：
-
-```bash
-.venv-vllm-0.26/bin/python -m vllm --help
-.venv-vllm-0.26/bin/python -c "import vllm, lmcache"
-```
-
-## 模型
-
-`scripts/debug/start_vllm_cluster.sh`通过环境变量选择模型：
-
-```bash
-KARESERVE_MODEL=/home/zn/llm_models/opt-1.3b \
-KARESERVE_MODEL_NAME=kareserve-opt-1.3b \
-KARESERVE_DTYPE=half \
-KARESERVE_GPU_MEMORY_UTILIZATION=0.5 \
-GPU_IDS=1 \
-bash scripts/debug/start_stack.sh
-```
-
-当前服务器模型目录包含：
-
-```text
-/home/zn/llm_models/opt-1.3b
-/home/zn/llm_models/opt-6.7b
-/home/zn/llm_models/gpt2
-/home/zn/llm_models/gpt2-xl
-```
-
-`KARESERVE_CHAT_TEMPLATE`指定Chat Template。空字符串关闭显式模板，模型服务随后使用自身配置。
-
-## 启动
-
-默认单 GPU1、LMCache启用、Router端口8090：
-
-```bash
-cd /home/zn/xyz/serve1
-GPU_IDS=1 bash scripts/debug/start_stack.sh
-```
-
-该脚本依次启动 LMCache MP Server、vLLM实例和 KaReserve Router，并等待 vLLM健康检查。关闭全部项目进程：
-
-```bash
-bash scripts/debug/stop_debug_cluster.sh
-```
-
-Router配置通过 `KARESERVE_CONFIG_PATH`指定：
-
-```bash
-KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/configs/router.two-node.json \
-GPU_IDS="0 1" \
-bash scripts/debug/start_stack.sh
-```
+调试脚本中的环境变量只覆盖单轮运行参数。固定拓扑和算法参数保留在Router JSON中，正式实验参数保留在Manifest中。
 
 ## 数据集
 
-正式工作负载入口为 `scripts/benchmark/run_vllm_benchmark.sh`。默认数据集是 vLLM内置 `prefix_repetition`，该数据集直接控制共享 Prefix长度、Suffix长度、Prefix数量和输出长度，适合验证 Prefix路由。
+`prefix_repetition`由vLLM Benchmark直接生成，可控制公共Prefix长度、Suffix长度、Prefix数量和输出长度，适合验证路由机制。当前Smoke Manifest使用该数据集。
+
+外部数据通过`dataset_name`和`dataset_path`进入vLLM Benchmark。项目提供ShareGPT转换器和确定性Trace生成器：
 
 ```bash
-KARESERVE_DATASET_NAME=prefix_repetition \
-KARESERVE_PREFIX_LEN=512 \
-KARESERVE_SUFFIX_LEN=64 \
-KARESERVE_NUM_PREFIXES=8 \
-KARESERVE_OUTPUT_LEN=16 \
-KARESERVE_NUM_PROMPTS=128 \
-KARESERVE_REQUEST_RATE=20 \
-bash scripts/benchmark/run_vllm_benchmark.sh
+.venv-vllm-0.26/bin/python scripts/data/convert_sharegpt.py --help
+.venv-vllm-0.26/bin/python scripts/data/build_prefix_trace.py --help
 ```
 
-外部数据集通过 `KARESERVE_DATASET_NAME`和 `KARESERVE_DATASET_PATH`指定：
+服务器现有原始数据位于`/home/zn/datasets/`，其中包含ShareGPT、LongBench和ArXiv Summarization。转换后的实验输入写入`runtime/datasets/`，该目录不进入Git。
+
+## 基线
+
+正式对比保持模型、数据集、请求轨迹、请求率、并发、seed和缓存初始状态一致。
+
+| 策略 | 决策依据 |
+|---|---|
+| `round_robin` | 到达顺序轮询 |
+| `least_load` | vLLM队列与Router在途工作量 |
+| `prefix_hash` | 固定长度Prefix哈希映射 |
+| `windowed_prefix`, `window_ms=0` | 单请求缓存与负载感知 |
+| `windowed_prefix`, `window_ms>0` | 窗口级Prefix、介质、负载与容量联合选点 |
+
+LMCache消融使用同一策略分别设置`runtime.enable_lmcache=false`和`true`。`runtime.reset_lmcache=true`会在每轮启动前清空项目`runtime`目录内的L2数据；L1和GPU缓存随进程停止释放。该流程保证各轮使用一致的冷缓存状态。
+
+## 执行
+
+Smoke Test验证启动、请求转发、缓存查询和结果保存：
 
 ```bash
-KARESERVE_DATASET_NAME=sharegpt \
-KARESERVE_DATASET_PATH=/path/to/sharegpt.json \
-bash scripts/benchmark/run_vllm_benchmark.sh
+cd /home/zn/xyz/serve1
+.venv-vllm-0.26/bin/python scripts/experiment/run_experiment.py \
+  --manifest configs/experiments/smoke.json
 ```
 
-服务器协作者数据包括：
-
-```text
-/home/zn/datasets/sharegpt             约1.8 GB，ShareGPT JSONL
-/home/zn/datasets/Longbench            约459 MB，长上下文JSONL
-/home/zn/datasets/arxiv_summarization  约7.1 GB，HuggingFace Arrow
-```
-
-ShareGPT文件使用 `conversation`字段的 JSONL格式。协作者脚本 `/home/zn/vllm_sharegpt_loadtest.py`支持该格式。vLLM官方 `sharegpt` Loader的直接兼容性需要单独验证。LongBench和ArXiv需要转换为 vLLM `custom`或 `timed_trace`输入后再用于正式实验。
-
-## 模型与数据的职责边界
-
-Router配置只包含节点地址、KV Event地址和路由参数。模型由 vLLM启动参数指定。数据集由 Benchmark启动参数指定。该结构允许同一 Router配置复用不同模型与数据集。
-
-```text
-configs/router.*.json          节点与路由策略
-KARESERVE_MODEL                模型路径
-KARESERVE_MODEL_NAME           API模型名
-KARESERVE_TOKENIZER            Benchmark Tokenizer
-KARESERVE_DATASET_NAME         数据集类型
-KARESERVE_DATASET_PATH         外部数据路径
-```
-
-## 对比对象
-
-策略对比使用相同模型、数据集、请求率、seed和缓存初始状态：
-
-```text
-Round Robin       到达顺序轮询
-Least Load        只使用实例负载
-Prefix Hash       固定Prefix映射
-Windowed Prefix   GPU Prefix、负载与容量联合选点
-```
-
-策略通过环境变量覆盖：
+Prefix路由实验使用确定性Trace：
 
 ```bash
-KARESERVE_POLICY_OVERRIDE=least_load \
-bash scripts/debug/start_router.sh
+.venv-vllm-0.26/bin/python scripts/experiment/run_experiment.py \
+  --manifest configs/experiments/prefix-routing.json
 ```
 
-窗口消融使用同一个 `windowed_prefix`策略：
+ShareGPT实验使用转换后的请求文件：
 
-```text
-KARESERVE_WINDOW_MS_OVERRIDE=0  单请求立即选点
-KARESERVE_WINDOW_MS_OVERRIDE=2  短时窗口联合选点
+```bash
+.venv-vllm-0.26/bin/python scripts/experiment/run_experiment.py \
+  --manifest configs/experiments/sharegpt-routing.json
 ```
 
-LMCache消融通过 `KARESERVE_ENABLE_LMCACHE=0`和`1`控制。每轮正式实验需要停止整个 Stack并重新启动，使GPU KVCache和LMCache具有一致的冷启动状态。
+`--dry-run`只校验Manifest并输出执行链路，`--leave-running`在最后一轮结束后保留服务。
 
-Benchmark结果默认写入 `runtime/benchmarks/`。`KARESERVE_BENCH_LABEL`和`KARESERVE_RESULT_FILENAME`控制结果文件名。
+## 结果
 
-`KARESERVE_BENCH_DRY_RUN=1`只输出最终 `vllm bench serve`命令，用于检查模型、数据集和结果参数。
+每轮结果位于`runtime/experiments/<name>/run-<index>/`。`run-manifest.json`记录原始Manifest、解析后的环境变量、Git提交和依赖版本；`result.json`保存vLLM Benchmark指标；`router-state.json`保存实验结束时的Router与缓存状态。所有轮次完成后，`summary.json`汇总成功率、吞吐量、TTFT和端到端延迟。
+
+Router日志中的`route_decision`记录节点选择、GPU/主机内存/磁盘Prefix长度、窗口等待和预计成本。响应头提供同一组请求级信息，便于对照Benchmark结果。
+
+## 专项验证
+
+LMCache跨vLLM进程持久性使用以下脚本：
+
+```bash
+GPU_IDS=1 bash scripts/experiment/verify_lmcache_persistence.sh
+```
+
+硬件Profile使用项目测速脚本生成。H2D测速写入CPU介质参数，文件系统读取测速写入FS介质参数：
+
+```bash
+.venv-vllm-0.26/bin/python scripts/benchmark/measure_h2d_bandwidth.py --help
+.venv-vllm-0.26/bin/python scripts/benchmark/measure_storage_bandwidth.py --help
+```

@@ -1,127 +1,53 @@
 # KaReserve
 
-KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，根据公共 Token Prefix、各实例的本地 KVCache 和运行负载完成实例分配。vLLM 继续负责 Continuous Batching、Paged KVCache 和模型执行。
-
-## 项目目录
-
-```text
-kareserve/          Router核心代码
-configs/            通用、单节点和双实例配置
-scripts/debug/      本地服务启动、停止和LMCache探测
-scripts/benchmark/  硬件测速与工作负载Benchmark
-scripts/data/       数据转换与确定性Trace生成
-scripts/experiment/ Manifest校验与实验执行
-configs/experiments/正式实验Manifest
-docs/               架构与实验说明
-```
-
-`configs/router.example.json`提供通用配置字段；`configs/router.single-node.json`保存当前单节点实测配置；`configs/router.two-node.json`提供双节点模板。完整架构与多实体方向见[架构文档](docs/architecture.md)，配置优先级见[配置文档](docs/configuration.md)，实际操作见[启动测试教程](docs/quickstart.md)，对比实验见[实验文档](docs/experiments.md)。
-
-## 请求链路
+KaReserve 是部署在多个 vLLM 实例前方的 Prefix-aware Router。Router 在短时间窗口内收集请求，查询各实例的 GPU Prefix Cache、共享 LMCache 和运行负载，然后完成实例分配。vLLM 继续管理 Continuous Batching、Paged KVCache 和模型执行。
 
 ```text
 Benchmark / Client
-        ↓
+        │ OpenAI HTTP
+        ▼
 KaReserve Router
-  1. 使用本地 Tokenizer生成 Token IDs
-  2. 进入短时 Request Pool
-  3. 执行窗口级路由策略
-  4. 转发到目标 vLLM
-        ↓
-vLLM Continuous Batching
+  Tokenizer → Request Pool → Cache Lookup → Policy
+        │
+        ├── vLLM instance 0 ── GPU KVCache
+        └── vLLM instance 1 ── GPU KVCache
+                    │
+                    └── LMCache ── host memory / filesystem
 ```
 
-Router 提供以下接口：
-
-- `POST /v1/completions`
-- `POST /v1/chat/completions`
-- `GET /health`
-- `GET /routing/state`
-
-Completion 响应包含目标实例、路由策略、窗口大小、Router 等待时间和 Prefix 命中长度等响应头。Router 日志为每个请求记录一条 `route_decision` JSON。
-
-## 路由策略
-
-`routing.policy` 支持以下值：
-
-- `round_robin`：按照窗口到达顺序轮询实例。
-- `least_load`：按照实例负载和窗口内虚拟负载分配。
-- `prefix_hash`：将固定长度 Prefix 稳定映射到实例。
-- `windowed_prefix`：按共享 Prefix 形成逻辑请求组，并联合考虑 GPU 本地缓存命中、实例负载和 KVCache 容量压力。组内请求仍以独立 HTTP 请求转发，vLLM 负责实际执行批次。
-
-`routing.window_ms=0` 表示逐请求立即分配。正数窗口表示 Router 最多等待对应时间收集请求。`routing.max_batch_size` 会提前触发窗口处理。
-
-```json
-{
-  "routing": {
-    "policy": "windowed_prefix",
-    "window_ms": 2.0,
-    "max_batch_size": 64,
-    "prefix_hash_tokens": 256,
-    "prefix_tokens_per_load_unit": 256.0,
-    "queue_weight": 1.0,
-    "kv_cache_weight": 2.0,
-    "kv_cache_high_watermark": 0.8,
-    "kv_cache_hard_limit": 0.95,
-    "decode_token_weight": 4.0,
-    "group_block_size": 16
-  }
-}
-```
-
-`windowed_prefix` 将不同缓存介质的命中 token 换算为复用成本，将运行队列、Router在途工作和窗口内新增工作换算为负载代价。窗口内新增工作使用目标实例未命中的 Prompt token 和加权 Decode token 计算。`kv_cache_high_watermark` 以上的容量占用产生二次增长惩罚；存在低于 `kv_cache_hard_limit` 的实例时，高于该阈值的实例退出候选集；全部实例超过阈值时，Router 选择占用最低的实例。vLLM `/metrics` 拉取失败的实例在存在健康实例时退出候选集。
-
-Router通过 vLLM KV Event维护实例级GPU缓存目录，通过KaReserve LMCache桥接接口查询主机内存L1与磁盘L2的当前Prefix状态。共享`cache_domain_id`的实例复用同一外部缓存查询结果。目标vLLM Connector执行最终Lookup和Load，实际命中量通过vLLM指标进入监控状态。
-
-## 硬件测速
-
-CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本通过 CUDA Event 测量多个数据尺寸，并输出线性拟合带宽、固定延迟和各尺寸分位延迟：
-
-```bash
-.venv-vllm-0.26/bin/python \
-  scripts/benchmark/measure_h2d_bandwidth.py \
-  --device 1 \
-  --sizes-mib 1,4,16,64 \
-  --warmup 10 \
-  --iterations 30
-```
-
-测速结果写入运行配置的 `hardware_profile`：
-
-```json
-{
-  "hardware_profile": {
-    "h2d_bandwidth_gbps": 0.0,
-    "h2d_base_latency_ms": 0.0,
-    "measurement": "scripts/benchmark/measure_h2d_bandwidth.py"
-  }
-}
-```
-
-当前路由策略使用该 Profile估算CPU到GPU加载成本。Profile缺少完整模型与硬件字段时，策略使用归一化成本模型。
-
-## 运行环境
-
-服务器使用一个项目运行环境：
+## 目录
 
 ```text
-/home/zn/xyz/serve1/.venv-vllm-0.26
+kareserve/            Router实现
+configs/router.*      节点、缓存域和策略配置
+configs/experiments/  可复现实验Manifest
+scripts/debug/        服务启动与停止
+scripts/benchmark/    vLLM Benchmark、测速和结果汇总
+scripts/data/         数据转换与Trace生成
+scripts/experiment/   实验运行与校验
+docs/architecture.md  系统状态与决策逻辑
+docs/experiments.md   数据集、基线和执行流程
 ```
 
-该环境包含vLLM 0.26.0、Torch 2.11.0、CUDA 13运行库和LMCache 0.5.2。`KARESERVE_ENABLE_LMCACHE`控制vLLM是否启用LMCache Connector，功能开关不切换Python环境。日常启动无需执行`activate`。
+## 启动
 
-## 调试启动
+服务器运行环境位于`/home/zn/xyz/serve1/.venv-vllm-0.26`，其中包含 vLLM 0.26.0、LMCache 0.5.2、Torch 和 CUDA。脚本直接使用该环境，无需执行`activate`。
 
-调试脚本只支持 GPU 0、GPU 1、GPU 2。每张 GPU 对应独立的 HTTP、KV Event和事件Replay端口。
+单实例调试使用 GPU 1：
 
 ```bash
 cd /home/zn/xyz/serve1
-GPU_IDS=1 bash scripts/debug/start_vllm_cluster.sh
-
 GPU_IDS=1 bash scripts/debug/start_stack.sh
+curl http://127.0.0.1:8090/routing/state
 ```
 
-双实例启动需要确认两张 GPU均为空闲：
+停止本项目启动的进程：
+
+```bash
+bash scripts/debug/stop_debug_cluster.sh
+```
+
+双实例运行使用与 GPU 端口映射一致的配置：
 
 ```bash
 KARESERVE_CONFIG_PATH=/home/zn/xyz/serve1/configs/router.two-node.json \
@@ -129,50 +55,21 @@ GPU_IDS="0 1" \
 bash scripts/debug/start_stack.sh
 ```
 
-停止项目启动的全部调试进程：
+## 实验入口
+
+Manifest 同时固定模型、GPU、LMCache、Router配置、数据集和请求负载。Smoke Test 的执行命令如下：
 
 ```bash
-bash scripts/debug/stop_debug_cluster.sh
+.venv-vllm-0.26/bin/python scripts/experiment/run_experiment.py \
+  --manifest configs/experiments/smoke.json
 ```
 
-停止脚本根据 PID 文件和 serve1 命令路径核对进程归属。运行日志、PID、Benchmark 结果和独立环境均位于 Git 忽略目录。
+运行记录写入`runtime/experiments/<name>/`，其中包含解析后的Manifest、软件版本、Git提交、Benchmark结果、Router状态和汇总结果。详细的工作负载与对照组见[实验说明](docs/experiments.md)。
 
-## vLLM Benchmark
+## 接口
 
-Router 接口兼容 `vllm bench serve` 的 Chat Completions 和 Completions 请求。Prefix 基础测试示例：
+Router透传`POST /v1/completions`和`POST /v1/chat/completions`，并提供`GET /health`和`GET /routing/state`。响应头记录目标实例、窗口大小、Router等待时间、各介质Prefix命中长度和预计代价。服务日志为每个请求写入一条`route_decision` JSON。
 
-```bash
-KARESERVE_DATASET_NAME=prefix_repetition \
-KARESERVE_PREFIX_LEN=512 \
-KARESERVE_NUM_PROMPTS=128 \
-KARESERVE_REQUEST_RATE=20 \
-bash scripts/benchmark/run_vllm_benchmark.sh
-```
+## 当前边界
 
-正式策略对比需要复用相同模型、seed、请求轨迹和冷缓存启动流程。Round Robin、Prefix Hash、Window=0 和 Windowed Prefix 分别运行并独立保存结果。
-
-## LMCache MP
-
-LMCache和vLLM使用同一个项目环境。LMCache开关只改变vLLM启动参数。
-
-启动独立 LMCache Server：
-
-```bash
-bash scripts/debug/start_lmcache_server.sh
-```
-
-启动连接 LMCache MP Server 的 vLLM：
-
-```bash
-KARESERVE_LMCACHE_MP=1 \
-GPU_IDS=1 \
-bash scripts/debug/start_vllm_cluster.sh
-```
-
-LMCache Server默认监听ZMQ端口`127.0.0.1:5555`和HTTP管理端口`127.0.0.1:8080`，主机内存L1默认容量为32 GiB，文件系统L2默认容量上限为64 GiB，两层均使用LRU。启动入口加载官方LMCache MP Server并增加只读Prefix查询接口。vLLM使用`LMCacheMPConnector`和非Hybrid KV Cache Manager。`scripts/debug/lmcache_probe.py`提供确定性长Prefix请求和缓存指标输出。KaReserve从各vLLM`/metrics`读取LMCache查询量和命中量，并通过`/routing/state`输出累计值。
-
-`scripts/experiment/verify_lmcache_persistence.sh`保持LMCache Server运行并重启vLLM，验证KVCache跨vLLM进程Store和Retrieve。
-
-## 项目边界
-
-KaReserve管理请求窗口、Prefix逻辑分组、多介质Prefix查询、容量与负载感知选点和HTTP转发。vLLM管理执行批次和GPU KVCache。LMCache通过vLLM KV Connector管理共享主机内存与磁盘KVCache。Router在窗口分配前批量查询LMCache当前对象状态，查询使用LMCache官方Token Hasher、L1对象表和L2 Adapter Lookup。vLLM连接器负责实际请求的缓存锁、数据加载和GPU Block写入。当前单机路由不执行GPU间KVCache传输。
+Router负责请求聚合、Prefix分组、GPU与LMCache状态查询、实例选择和HTTP转发。vLLM负责实际执行批次。LMCache Connector负责缓存锁、主机内存或磁盘数据加载以及GPU Block写入。当前实现不执行GPU间KVCache迁移，也不合并首次并发Prefix Miss。完整的数据来源和成本模型见[架构说明](docs/architecture.md)。
