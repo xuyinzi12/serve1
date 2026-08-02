@@ -79,7 +79,7 @@ class CostModel:
             return max(0, tokens) * self.compute_ms_per_token
         return max(0, tokens) / self.tokens_per_work_unit
 
-    def load_cost(self, medium: CacheMedium, tokens: int) -> float:
+    def _direct_load_cost(self, medium: CacheMedium, tokens: int) -> float:
         tokens = max(0, tokens)
         profile = (self.medium_profiles or {}).get(medium.value)
         if profile and self.kv_bytes_per_token is not None:
@@ -96,6 +96,17 @@ class CostModel:
             CacheMedium.UNKNOWN: self.unknown_load_weight,
         }
         return tokens * weights.get(medium, 0.0) / self.tokens_per_work_unit
+
+    def load_cost(self, medium: CacheMedium, tokens: int) -> float:
+        if medium is CacheMedium.FS:
+            return self._direct_load_cost(
+                CacheMedium.FS, tokens
+            ) + self._direct_load_cost(CacheMedium.CPU, tokens)
+        if medium is CacheMedium.OBJ:
+            return self._direct_load_cost(
+                CacheMedium.OBJ, tokens
+            ) + self._direct_load_cost(CacheMedium.CPU, tokens)
+        return self._direct_load_cost(medium, tokens)
 
     def candidate_work(
         self, request: SchedulerRequest, candidate: RouteCandidate

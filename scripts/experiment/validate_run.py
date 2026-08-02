@@ -67,6 +67,23 @@ def main() -> None:
     ]
     if missing_domains:
         raise ValueError(f"Nodes are missing cache_domain_id: {missing_domains}")
+    cache_domains = config.get("cache_domains", {})
+    undefined_domains = {
+        node["cache_domain_id"] for node in nodes
+    } - cache_domains.keys()
+    if undefined_domains:
+        raise ValueError(
+            f"Router cache_domains lacks: {sorted(undefined_domains)}"
+        )
+    missing_http_urls = [
+        domain_id
+        for domain_id, domain in cache_domains.items()
+        if not domain.get("http_url")
+    ]
+    if missing_http_urls:
+        raise ValueError(
+            f"Cache domains are missing http_url: {missing_http_urls}"
+        )
 
     print(
         json.dumps(

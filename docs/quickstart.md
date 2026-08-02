@@ -136,7 +136,7 @@ GPU_IDS=1 bash scripts/experiment/verify_lmcache_persistence.sh
 
 第一阶段负责Store，第二阶段负责Retrieve。第二阶段的`external_prefix_cache_hits_total`增长构成CPU KVCache复用证据。
 
-LMCache MP Connector当前不发布CPU L1块级Store和Evict事件。Router在请求成功完成后登记完整外部缓存Chunk，并把该目录用于路由成本估算。`/routing/state`中的`monitoring`保存vLLM实际Lookup与命中累计值，`cache_catalog.external_source`标明预测目录来源。vLLM Connector对每个请求执行最终Lookup。
+LMCache MP Connector当前不发布主机内存L1块级Store和Evict事件。KaReserve桥接入口直接查询LMCache当前L1对象表和L2 Adapter，Router在每个请求窗口内执行一次批量Prefix查询。`/routing/state`中的`cache_catalog.external_lookup`记录查询批次、失败次数和缓存域错误，`monitoring`保存vLLM实际Lookup与命中累计值。vLLM Connector对每个请求执行最终Lookup。
 
 ## 9. 手工调试
 

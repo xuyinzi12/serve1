@@ -22,7 +22,7 @@ Router JSON提供节点与策略完整配置
 
 `tokenizer`定义Router本地Chat Template。Router从`KARESERVE_TOKENIZER_PATH`或`KARESERVE_MODEL`加载Tokenizer，并在进程内生成Token IDs。Router与所有vLLM实例使用相同模型版本和Chat Template。
 
-`routing`定义窗口、窗口容量、预期输出长度、外部缓存Chunk大小、策略权重和KVCache容量阈值。`hardware_profile`记录硬件实测结果，并向介质感知成本模型提供H2D带宽与模型计算参数。
+`cache_domains`定义外部缓存实体的HTTP端点、模型名、World Size和Cache Salt。`routing`定义窗口、窗口容量、LMCache查询超时、预期输出长度、策略权重和KVCache容量阈值。`hardware_profile`记录硬件实测结果，并向介质感知成本模型提供主机内存到GPU带宽、磁盘读取带宽与模型参数。
 
 ## 实验Manifest
 
@@ -37,6 +37,9 @@ Router JSON提供节点与策略完整配置
     "gpu_ids": [0, 1],
     "enable_lmcache": true,
     "lmcache_l1_size_gb": 32,
+    "lmcache_l2_enabled": true,
+    "lmcache_l2_path": "runtime/lmcache/l2",
+    "lmcache_l2_capacity_gb": 64,
     "model": "/home/zn/llm_models/opt-1.3b",
     "model_name": "kareserve-opt-1.3b",
     "dtype": "half",
@@ -74,6 +77,9 @@ Router JSON提供节点与策略完整配置
 | `KARESERVE_GPU_MEMORY_UTILIZATION` | vLLM显存使用比例 | `0.5` |
 | `KARESERVE_ENABLE_LMCACHE` | LMCache功能开关 | `1` |
 | `LMCACHE_L1_SIZE_GB` | LMCache CPU缓存容量 | `32` |
+| `LMCACHE_ENABLE_L2` | LMCache文件系统缓存开关 | `1` |
+| `LMCACHE_L2_PATH` | LMCache文件系统缓存目录 | `runtime/lmcache/l2` |
+| `LMCACHE_L2_CAPACITY_GB` | LMCache文件系统缓存容量上限 | `64` |
 | `KARESERVE_POLICY_OVERRIDE` | 策略消融覆盖 | 空 |
 | `KARESERVE_WINDOW_MS_OVERRIDE` | 聚合窗口覆盖 | 空 |
 | `KARESERVE_DATASET_NAME` | vLLM Benchmark数据集类型 | `prefix_repetition` |

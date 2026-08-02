@@ -28,7 +28,7 @@ Router在本地加载与vLLM一致的Tokenizer和Chat Template，并生成准确
 
 Prefix组表示窗口内具有公共Token Prefix的一组请求。组内请求获得同一个目标实例，Router仍然逐请求转发，vLLM决定实际执行批次。当前实现不提供首次并发Miss合并，也不提供GPU间KVCache传输。
 
-LMCache Lookup与Load发生在请求进入目标vLLM之后。LMCache MP Connector 0.5.2不发布CPU L1块级Store和Evict事件，HTTP管理接口也不提供无副作用的L1 Prefix Lookup。Router在请求成功完成后登记完整外部缓存Chunk，并将其作为预测目录。共享`cache_domain_id`的实例共享该目录。目录可能因LRU淘汰产生陈旧项，目标vLLM Connector负责最终命中校验，vLLM外部缓存指标记录实际结果。
+Router在窗口分配前通过KaReserve LMCache桥接接口执行批量Prefix查询。桥接接口使用LMCache官方Token Hasher生成ObjectKey，直接读取主机内存L1对象状态，并通过L2 Adapter Lookup读取文件系统或对象存储状态。共享`cache_domain_id`的实例共享同一查询结果。查询状态反映调用时刻的Store、Evict和Clear结果。目标vLLM Connector继续负责缓存锁、实际Load和GPU Block写入，vLLM外部缓存指标记录执行结果。
 
 `windowed_prefix`策略使用GPU直接复用成本、外部缓存加载成本、未命中计算成本、实例队列、Router在途工作和GPU容量压力完成窗口级选点。完整Hardware Profile提供H2D带宽和模型计算参数，缺失字段触发归一化成本模型。
 
@@ -90,7 +90,7 @@ Router 对请求和实体计算：
 
 ### 每实体 LMCache
 
-每台主机运行独立 LMCache服务。CPU内存构成本机快速外部缓存，本地磁盘构成本机容量层。Router需要获得各实体外部缓存的只读目录状态。实现路径包含 LMCache Controller集成或 Store、Evict、Clear事件驱动的 KaReserve目录。
+每台主机运行独立 LMCache服务。主机内存构成本机快速外部缓存，本地磁盘构成本机容量层。每个服务公开KaReserve只读Prefix查询接口，Router按照`cache_domain_id`并发查询各实体。多实体配置通过独立`cache_domains`端点表达缓存所有权。
 
 目标请求到达实体后，本地 vLLM Connector负责 Lookup、缓存锁、CPU或磁盘加载和GPU Block写入。Router负责选择实体与估算代价，执行层负责最终数据正确性。
 

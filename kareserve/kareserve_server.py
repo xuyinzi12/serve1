@@ -26,6 +26,7 @@ from kareserve.kareserve_policy import (
     RoundRobinPolicy,
     WindowedPrefixAffinityPolicy,
 )
+from kareserve.lmcache_lookup import CacheDomainConfig, LMCacheLookupClient
 from kareserve.kareserve_state import NodeRoutingState, NodeState, SchedulerRequest
 from kareserve.kareserve_tokenizer import LocalRequestTokenizer
 from kareserve.kareserve_tracker import KareserveTracker
@@ -44,7 +45,8 @@ class RouterConfig:
     chat_template_path: str | None = None
     allow_request_chat_template: bool = False
     external_cache_enabled: bool = False
-    external_cache_chunk_size: int = 256
+    cache_domains: dict[str, CacheDomainConfig] = field(default_factory=dict)
+    lmcache_lookup_timeout_seconds: float = 1.0
     policy: str = "windowed_prefix"
     window_ms: float = 2.0
     max_batch_size: int = 64
@@ -108,6 +110,27 @@ def load_config(config_path: str) -> RouterConfig:
         "chat_template_path"
     )
     routing = data.get("routing", {})
+    model_name_override = os.environ.get("KARESERVE_MODEL_NAME")
+    cache_domains = {
+        domain_id: CacheDomainConfig(
+            domain_id=domain_id,
+            http_url=str(domain["http_url"]),
+            world_size=max(1, int(domain.get("world_size", 1))),
+            cache_salt=str(domain.get("cache_salt", "")),
+            model_name=model_name_override or domain.get("model_name"),
+        )
+        for domain_id, domain in data.get("cache_domains", {}).items()
+    }
+    node_domains = {
+        node.get("cache_domain_id", node["node_id"]) for node in nodes
+    }
+    missing_domains = node_domains - cache_domains.keys()
+    external_cache_enabled = os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"
+    if external_cache_enabled and missing_domains:
+        raise ValueError(
+            "LMCache is enabled but cache_domains lacks: "
+            + ", ".join(sorted(missing_domains))
+        )
     policy_override = os.environ.get("KARESERVE_POLICY_OVERRIDE")
     window_override = os.environ.get("KARESERVE_WINDOW_MS_OVERRIDE")
     return RouterConfig(
@@ -119,9 +142,10 @@ def load_config(config_path: str) -> RouterConfig:
         allow_request_chat_template=bool(
             tokenizer.get("allow_request_chat_template", False)
         ),
-        external_cache_enabled=(os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"),
-        external_cache_chunk_size=max(
-            1, int(routing.get("external_cache_chunk_size", 256))
+        external_cache_enabled=external_cache_enabled,
+        cache_domains=cache_domains,
+        lmcache_lookup_timeout_seconds=max(
+            0.01, float(routing.get("lmcache_lookup_timeout_seconds", 1.0))
         ),
         policy=policy_override or routing.get("policy", "windowed_prefix"),
         window_ms=(
@@ -213,12 +237,20 @@ async def lifespan(app: FastAPI):
     ]
     tracker = KareserveTracker(initial_nodes)
     policy = build_policy(config)
+    lmcache_lookup = None
+    if config.external_cache_enabled:
+        lmcache_lookup = LMCacheLookupClient(
+            config.cache_domains,
+            timeout_seconds=config.lmcache_lookup_timeout_seconds,
+        )
+        await lmcache_lookup.start()
     request_pool = RequestPool(
         tracker=tracker,
         policy=policy,
         window_ms=config.window_ms,
         max_batch_size=config.max_batch_size,
         group_block_size=config.group_block_size,
+        lmcache_lookup=lmcache_lookup,
     )
 
     app.state.config = config
@@ -226,6 +258,7 @@ async def lifespan(app: FastAPI):
     app.state.tracker = tracker
     app.state.request_pool = request_pool
     app.state.policy = policy
+    app.state.lmcache_lookup = lmcache_lookup
     for node in config.nodes:
         endpoint = node.get("kv_events_endpoint")
         if endpoint:
@@ -246,6 +279,8 @@ async def lifespan(app: FastAPI):
             await metrics_task
         await request_pool.stop()
         await tracker.stop()
+        if lmcache_lookup is not None:
+            await lmcache_lookup.close()
 
 
 app = FastAPI(title="Kareserve Cluster Scheduler Gateway", lifespan=lifespan)
@@ -298,21 +333,13 @@ async def stream_upstream(
     tracker: KareserveTracker,
     node_id: str,
     inflight_work: float,
-    prompt_tokens: list[int],
-    external_cache_chunk_size: int | None,
 ) -> AsyncGenerator[bytes, None]:
-    completed = False
     try:
         async for chunk in response.content.iter_any():
             yield chunk
-        completed = True
     finally:
         response.release()
         await session.close()
-        if completed and external_cache_chunk_size is not None:
-            tracker.record_external_prefix(
-                node_id, prompt_tokens, external_cache_chunk_size
-            )
         tracker.release_route(node_id, inflight_work)
 
 
@@ -322,16 +349,9 @@ async def read_upstream(
     tracker: KareserveTracker,
     node_id: str,
     inflight_work: float,
-    prompt_tokens: list[int],
-    external_cache_chunk_size: int | None,
 ) -> bytes:
     try:
-        content = await response.read()
-        if external_cache_chunk_size is not None:
-            tracker.record_external_prefix(
-                node_id, prompt_tokens, external_cache_chunk_size
-            )
-        return content
+        return await response.read()
     finally:
         response.release()
         await session.close()
@@ -354,6 +374,8 @@ def route_headers(
         "X-Kareserve-Queue-Wait-Ms": f"{assignment.queue_wait_ms:.3f}",
         "X-Kareserve-GPU-Prefix-Tokens": str(match.gpu_prefix_tokens),
         "X-Kareserve-CPU-Prefix-Tokens": str(match.cpu_prefix_tokens),
+        "X-Kareserve-FS-Prefix-Tokens": str(match.fs_prefix_tokens),
+        "X-Kareserve-OBJ-Prefix-Tokens": str(match.obj_prefix_tokens),
         "X-Kareserve-Estimated-Cost": f"{assignment.estimated_cost:.6f}",
         "X-Kareserve-KV-Cache-Usage": usage,
     }
@@ -419,6 +441,8 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "prompt_tokens": len(prompt_tokens),
                 "gpu_prefix_tokens": match.gpu_prefix_tokens,
                 "cpu_prefix_tokens": match.cpu_prefix_tokens,
+                "fs_prefix_tokens": match.fs_prefix_tokens,
+                "obj_prefix_tokens": match.obj_prefix_tokens,
                 "missing_tokens": match.missing_tokens,
                 "router_inflight_work": node.router_inflight_work,
                 "estimated_cost": assignment.estimated_cost,
@@ -452,12 +476,6 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 tracker,
                 node.node_id,
                 assignment.inflight_work,
-                prompt_tokens,
-                (
-                    config.external_cache_chunk_size
-                    if config.external_cache_enabled and response.status < 400
-                    else None
-                ),
             ),
             status_code=response.status,
             headers=response_headers,
@@ -468,12 +486,6 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         tracker,
         node.node_id,
         assignment.inflight_work,
-        prompt_tokens,
-        (
-            config.external_cache_chunk_size
-            if config.external_cache_enabled and response.status < 400
-            else None
-        ),
     )
     return Response(
         content=content,
@@ -538,11 +550,15 @@ async def routing_state(request: Request):
                 len(block.placements) for block in tracker.cached_blocks.values()
             ),
             "external_source": (
-                "completed_request_admission"
+                "lmcache_authoritative_lookup"
                 if config.external_cache_enabled
                 else "disabled"
             ),
-            "external_chunk_size": config.external_cache_chunk_size,
+            "external_lookup": (
+                request.app.state.lmcache_lookup.stats()
+                if request.app.state.lmcache_lookup is not None
+                else None
+            ),
         },
         "monitoring": {
             node_id: {

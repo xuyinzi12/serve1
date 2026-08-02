@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kareserve.kareserve_policy import KareserveBasePolicy
+from kareserve.lmcache_lookup import LMCacheLookupClient
 from kareserve.kareserve_state import (
     NodeRoutingState,
     PrefixMatch,
@@ -41,12 +42,14 @@ class RequestPool:
         window_ms: float = 2.0,
         max_batch_size: int = 64,
         group_block_size: int = 16,
+        lmcache_lookup: LMCacheLookupClient | None = None,
     ) -> None:
         self.tracker = tracker
         self.policy = policy
         self.window_seconds = max(window_ms, 0.0) / 1000.0
         self.max_batch_size = max(1, max_batch_size)
         self.group_block_size = max(1, group_block_size)
+        self.lmcache_lookup = lmcache_lookup
         self.queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self.total_batches = 0
@@ -103,17 +106,21 @@ class RequestPool:
                 except asyncio.TimeoutError:
                     break
             try:
-                self._flush(batch)
+                await self._flush(batch)
             except Exception as exc:  # noqa: BLE001
                 for item in batch:
                     if not item.future.done():
                         item.future.set_exception(exc)
 
-    def _flush(self, batch: list[PendingRequest]) -> None:
+    async def _flush(self, batch: list[PendingRequest]) -> None:
         flushed_at = asyncio.get_running_loop().time()
         requests = [item.request for item in batch]
+        external_matches = None
+        if self.lmcache_lookup is not None:
+            external_matches, failed_domains = await self.lmcache_lookup.lookup(requests)
+            self.tracker.set_external_lookup_status(failed_domains)
         candidates = self.tracker.build_route_candidates(
-            requests, self.group_block_size
+            requests, self.group_block_size, external_matches
         )
         assignments = self.policy.select_batch(requests, candidates)
         self.total_batches += 1

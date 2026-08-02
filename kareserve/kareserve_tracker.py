@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 import time
@@ -138,6 +137,9 @@ class KareserveTracker:
         self.catalog_status = {
             node.node_id: CatalogStatus.HEALTHY for node in initial_nodes
         }
+        self.external_catalog_status = {
+            node.cache_domain_id: CatalogStatus.HEALTHY for node in initial_nodes
+        }
         self.last_sequence: dict[str, int] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._sockets: list[zmq.asyncio.Socket] = []
@@ -166,7 +168,13 @@ class KareserveTracker:
                 metrics_status=node.metrics_status,
                 metrics_updated_at=node.metrics_updated_at,
                 process_start_time_seconds=node.process_start_time_seconds,
-                catalog_status=self.catalog_status[node_id],
+                catalog_status=(
+                    CatalogStatus.HEALTHY
+                    if self.catalog_status[node_id] is CatalogStatus.HEALTHY
+                    and self.external_catalog_status[node.cache_domain_id]
+                    is CatalogStatus.HEALTHY
+                    else CatalogStatus.DEGRADED
+                ),
             )
         return routing_states
 
@@ -174,13 +182,30 @@ class KareserveTracker:
         self,
         requests: Sequence[SchedulerRequest],
         default_block_size: int,
+        external_matches: dict[str, dict[str, PrefixMatch]] | None = None,
     ) -> dict[str, dict[str, RouteCandidate]]:
         routing_states = self.get_routing_states()
         matrix: dict[str, dict[str, RouteCandidate]] = {}
         for request in requests:
             by_node: dict[str, RouteCandidate] = {}
             for node_id, node in routing_states.items():
-                match = self._match_prefix(request.prompt_tokens, node)
+                event_match = self._match_prefix(request.prompt_tokens, node)
+                external_match = (external_matches or {}).get(
+                    request.request_id, {}
+                ).get(node.cache_domain_id)
+                match = PrefixMatch(
+                    prompt_tokens=len(request.prompt_tokens),
+                    gpu_prefix_tokens=event_match.gpu_prefix_tokens,
+                    cpu_prefix_tokens=(
+                        external_match.cpu_prefix_tokens if external_match else 0
+                    ),
+                    fs_prefix_tokens=(
+                        external_match.fs_prefix_tokens if external_match else 0
+                    ),
+                    obj_prefix_tokens=(
+                        external_match.obj_prefix_tokens if external_match else 0
+                    ),
+                )
                 block_size = node.gpu_block_size or default_block_size
                 required_tokens = (
                     max(0, len(request.prompt_tokens) - match.gpu_prefix_tokens)
@@ -211,43 +236,13 @@ class KareserveTracker:
         node.router_active_requests = max(0, node.router_active_requests - 1)
         node.router_inflight_work = max(0.0, node.router_inflight_work - max(0.0, work))
 
-    def record_external_prefix(
-        self,
-        node_id: str,
-        prompt_tokens: Sequence[int],
-        chunk_size: int,
-    ) -> None:
-        node = self.nodes.get(node_id)
-        if node is None or chunk_size <= 0:
-            return
-        placement = CachePlacement(
-            medium=CacheMedium.CPU,
-            owner_id=node.cache_domain_id,
-            locality=CacheLocality.LOCAL,
-        )
-        self.block_sizes.setdefault(placement, set()).add(chunk_size)
-        parent_hash: BlockHash | None = None
-        for start in range(0, len(prompt_tokens) - chunk_size + 1, chunk_size):
-            block_tokens = tuple(prompt_tokens[start : start + chunk_size])
-            digest = hashlib.blake2b(digest_size=16)
-            if parent_hash is not None:
-                digest.update(str(parent_hash).encode("ascii"))
-            for token in block_tokens:
-                digest.update(int(token).to_bytes(8, "big", signed=True))
-            block_hash = f"router-cpu-{digest.hexdigest()}"
-            identity: BlockIdentity = (0, block_hash)
-            block = self.cached_blocks.get(identity)
-            if block is None:
-                block = CachedBlock(
-                    block_hash=block_hash,
-                    group_idx=0,
-                    parent_block_hash=parent_hash,
-                    token_ids=block_tokens,
-                )
-                self.cached_blocks[identity] = block
-            block.placements.add(placement)
-            self.block_index[(placement, 0, parent_hash, block_tokens)] = identity
-            parent_hash = block_hash
+    def set_external_lookup_status(self, failed_domains: set[str]) -> None:
+        for domain_id in self.external_catalog_status:
+            self.external_catalog_status[domain_id] = (
+                CatalogStatus.DEGRADED
+                if domain_id in failed_domains
+                else CatalogStatus.HEALTHY
+            )
 
     def update_metrics_text(self, node_id: str, metrics_text: str) -> None:
         node = self.nodes.get(node_id)

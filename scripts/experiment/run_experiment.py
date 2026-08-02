@@ -68,6 +68,9 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
         "GPU_IDS": runtime["gpu_ids"],
         "KARESERVE_ENABLE_LMCACHE": runtime["enable_lmcache"],
         "LMCACHE_L1_SIZE_GB": runtime["lmcache_l1_size_gb"],
+        "LMCACHE_ENABLE_L2": runtime.get("lmcache_l2_enabled", True),
+        "LMCACHE_L2_PATH": runtime.get("lmcache_l2_path"),
+        "LMCACHE_L2_CAPACITY_GB": runtime.get("lmcache_l2_capacity_gb", 64),
         "KARESERVE_MODEL": runtime["model"],
         "KARESERVE_MODEL_NAME": runtime["model_name"],
         "KARESERVE_DTYPE": runtime.get("dtype", "half"),
@@ -105,6 +108,9 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
     dataset_path = env.get("KARESERVE_DATASET_PATH")
     if dataset_path:
         env["KARESERVE_DATASET_PATH"] = str(resolve_path(dataset_path))
+    l2_path = env.get("LMCACHE_L2_PATH")
+    if l2_path:
+        env["LMCACHE_L2_PATH"] = str(resolve_path(l2_path))
     env["KARESERVE_MODEL"] = str(resolve_path(env["KARESERVE_MODEL"]))
     return env
 
