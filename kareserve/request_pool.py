@@ -3,15 +3,14 @@
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 
 from kareserve.kareserve_policy import (
     KareserveBasePolicy,
-    NodeState,
+    NodeRoutingState,
     SchedulerRequest,
 )
 from kareserve.kareserve_tracker import KareserveTracker
-
 
 @dataclass
 class PendingRequest:
@@ -19,13 +18,12 @@ class PendingRequest:
     future: asyncio.Future["AssignmentResult"]
     queued_at: float
 
-
 @dataclass(frozen=True)
 class AssignmentResult:
-    node: NodeState
-    batch_size: int
+    node: NodeRoutingState
+    route_batch_size: int
     queue_wait_ms: float
-
+    prefix_hit_blocks: int
 
 class RequestPool:
     def __init__(
@@ -34,11 +32,13 @@ class RequestPool:
         policy: KareserveBasePolicy,
         window_ms: float = 2.0,
         max_batch_size: int = 64,
+        group_block_size: int = 16,
     ) -> None:
         self.tracker = tracker
         self.policy = policy
         self.window_seconds = max(window_ms, 0.0) / 1000.0
         self.max_batch_size = max(1, max_batch_size)
+        self.group_block_size = max(1, group_block_size)
         self.queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self.total_batches = 0
@@ -71,7 +71,7 @@ class RequestPool:
         )
         return await future
 
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         return {
             "queued_requests": self.queue.qsize(),
             "total_batches": self.total_batches,
@@ -96,16 +96,19 @@ class RequestPool:
                     break
             self._flush(batch)
 
-    def _flush(self, batch: List[PendingRequest]) -> None:
+    def _flush(self, batch: list[PendingRequest]) -> None:
         flushed_at = asyncio.get_running_loop().time()
         requests = [item.request for item in batch]
         assignments = self.policy.select_batch(
-            requests, self.tracker.get_node_states()
+            requests,
+            self.tracker.get_routing_states(
+                [req.prompt_tokens for req in requests]
+            ),
         )
         self.total_batches += 1
         self.total_requests += len(batch)
         self.last_batch_size = len(batch)
-        for item in batch:
+        for req_idx, item in enumerate(batch):
             node = assignments.get(item.request.request_id)
             if node is None:
                 item.future.set_exception(RuntimeError("No available vLLM server"))
@@ -113,9 +116,10 @@ class RequestPool:
                 item.future.set_result(
                     AssignmentResult(
                         node=node,
-                        batch_size=len(batch),
+                        route_batch_size=len(batch),
                         queue_wait_ms=max(
                             0.0, (flushed_at - item.queued_at) * 1000.0
                         ),
+                        prefix_hit_blocks=node.matched_prefix_blocks[req_idx],
                     )
                 )

@@ -1,145 +1,183 @@
 # SPDX-License-Identifier: Apache-2.0
 """vLLM KV-event and server-metric tracking."""
 
-import copy
-import json
 import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List
+from _thread import LockType
+from typing import Any, Sequence
 
-from kareserve.kareserve_policy import CachedBlock, NodeState
+from kareserve.kareserve_policy import CachedBlock, NodeState, NodeRoutingState
 
-try:
-    import msgspec
-    import zmq
-
-    HAS_VLLM_EVENT_DEPS = True
-except ImportError:
-    msgspec = None
-    zmq = None
-    HAS_VLLM_EVENT_DEPS = False
+import msgspec
+import zmq
 
 logger = logging.getLogger("kareserve.tracker")
-WireBlockHash = bytes | int
+ExternalBlockHash = bytes | int
 
 
-if HAS_VLLM_EVENT_DEPS:
+class RawBlockStored(
+    msgspec.Struct,
+    array_like=True,
+    tag="BlockStored",
+    omit_defaults=True,
+):
+    block_hashes: list[ExternalBlockHash]
+    parent_block_hash: ExternalBlockHash | None
+    token_ids: list[int]
+    block_size: int
+    lora_id: int | None = None
+    medium: str | None = None
+    lora_name: str | None = None
+    extra_keys: list[Any] | None = None
+    group_idx: int | None = None #需要确认 vLLM 发出的不同组是否会在当前索引中发生混淆
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
+    locality: str | None = None
 
-    class RawBlockStored(
-        msgspec.Struct,
-        array_like=True,
-        tag="BlockStored",
-        omit_defaults=True,
-    ):
-        block_hashes: List[WireBlockHash]
-        parent_block_hash: WireBlockHash | None
-        token_ids: List[int]
-        block_size: int
-        lora_id: int | None = None
-        medium: str | None = None
-        lora_name: str | None = None
-        extra_keys: List[Any] | None = None
-        group_idx: int | None = None
-        kv_cache_spec_kind: str | None = None
-        kv_cache_spec_sliding_window: int | None = None
-        locality: str | None = None
+class RawBlockRemoved(
+    msgspec.Struct,
+    array_like=True,
+    tag="BlockRemoved",
+    omit_defaults=True,
+):
+    block_hashes: list[ExternalBlockHash]
+    medium: str | None = None #如果只删除 GPU 副本，外部缓存副本可能仍然存在。但当前 Tracker 的删除实现没有读取 medium
+    group_idx: int | None = None
+    locality: str | None = None
 
-    class RawBlockRemoved(
-        msgspec.Struct,
-        array_like=True,
-        tag="BlockRemoved",
-        omit_defaults=True,
-    ):
-        block_hashes: List[WireBlockHash]
-        medium: str | None
-        group_idx: int | None = None
-        locality: str | None = None
+class RawAllBlocksCleared(
+    msgspec.Struct,
+    array_like=True,
+    tag="AllBlocksCleared",
+    omit_defaults=True,
+):
+    pass
 
-    class RawAllBlocksCleared(
-        msgspec.Struct,
-        array_like=True,
-        tag="AllBlocksCleared",
-        omit_defaults=True,
-    ):
-        pass
+RawEvent = RawBlockStored | RawBlockRemoved | RawAllBlocksCleared
 
-    RawEvent = RawBlockStored | RawBlockRemoved | RawAllBlocksCleared
+class RawEventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
+    ts: float
+    events: list[RawEvent]
+    data_parallel_rank: int | None = None
 
-    class RawEventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
-        ts: float
-        events: List[RawEvent]
-        data_parallel_rank: int | None = None
+class RawMapBlockStored(
+    msgspec.Struct,
+    tag="BlockStored",
+    omit_defaults=True,
+):
+    block_hashes: list[ExternalBlockHash]
+    parent_block_hash: ExternalBlockHash | None
+    token_ids: list[int]
+    block_size: int
+    lora_id: int | None = None
+    medium: str | None = None
+    lora_name: str | None = None
+    extra_keys: list[Any] | None = None
+    group_idx: int | None = None
+    kv_cache_spec_kind: str | None = None
+    kv_cache_spec_sliding_window: int | None = None
+    locality: str | None = None
 
-    class RawMapBlockStored(
-        msgspec.Struct,
-        tag="BlockStored",
-        omit_defaults=True,
-    ):
-        block_hashes: List[WireBlockHash]
-        parent_block_hash: WireBlockHash | None
-        token_ids: List[int]
-        block_size: int
-        lora_id: int | None = None
-        medium: str | None = None
-        lora_name: str | None = None
-        extra_keys: List[Any] | None = None
-        group_idx: int | None = None
-        kv_cache_spec_kind: str | None = None
-        kv_cache_spec_sliding_window: int | None = None
-        locality: str | None = None
+class RawMapBlockRemoved(
+    msgspec.Struct,
+    tag="BlockRemoved",
+    omit_defaults=True,
+):
+    block_hashes: list[ExternalBlockHash]
+    medium: str | None
+    group_idx: int | None = None
+    locality: str | None = None
 
-    class RawMapBlockRemoved(
-        msgspec.Struct,
-        tag="BlockRemoved",
-        omit_defaults=True,
-    ):
-        block_hashes: List[WireBlockHash]
-        medium: str | None
-        group_idx: int | None = None
-        locality: str | None = None
+class RawMapAllBlocksCleared(
+    msgspec.Struct,
+    tag="AllBlocksCleared",
+    omit_defaults=True,
+):
+    pass
 
-    class RawMapAllBlocksCleared(
-        msgspec.Struct,
-        tag="AllBlocksCleared",
-        omit_defaults=True,
-    ):
-        pass
+RawMapEvent = (
+    RawMapBlockStored | RawMapBlockRemoved | RawMapAllBlocksCleared
+)
 
-    RawMapEvent = (
-        RawMapBlockStored | RawMapBlockRemoved | RawMapAllBlocksCleared
-    )
-
-    class RawMapEventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
-        ts: float
-        events: List[RawMapEvent]
-        data_parallel_rank: int | None = None
-
+class RawMapEventBatch(msgspec.Struct, array_like=True, omit_defaults=True):
+    ts: float
+    events: list[RawMapEvent]
+    data_parallel_rank: int | None = None
 
 class KareserveTracker:
-    def __init__(self, initial_nodes: List[NodeState]) -> None:
+    def __init__(self, initial_nodes: list[NodeState]) -> None:
         self.nodes = {node.node_id: node for node in initial_nodes}
-        self._lock = threading.Lock()
+        self._nodes_lock = threading.Lock()
+        self._node_locks = {node.node_id: threading.Lock() for node in initial_nodes}
         self._running = False
-        self._threads: List[threading.Thread] = []
+        self._threads: list[threading.Thread] = []
         self._decoders = (
-            (
-                msgspec.msgpack.Decoder(RawMapEventBatch),
-                msgspec.msgpack.Decoder(RawEventBatch),
-            )
-            if HAS_VLLM_EVENT_DEPS
-            else ()
+            msgspec.msgpack.Decoder(RawMapEventBatch),
+            msgspec.msgpack.Decoder(RawEventBatch),
         )
+        self._decoder_index_by_node: dict[str, int] = {} #用于记录每个节点上一次成功使用的解码器编号
 
-    def get_node_states(self) -> Dict[str, NodeState]:
-        with self._lock:
-            return copy.deepcopy(self.nodes)
+    def _get_node_and_lock(
+        self, node_id: str
+    ) -> tuple[NodeState | None, LockType | None]:
+        with self._nodes_lock:
+            return self.nodes.get(node_id), self._node_locks.get(node_id)
+
+    def get_routing_states(
+        self, batch_prompt_tokens: Sequence[Sequence[int]] #表示这一轮可能同时为一批请求计算路由状态。
+    ) -> dict[str, NodeRoutingState]:
+        scores: dict[str, NodeRoutingState] = {}
+        with self._nodes_lock:
+            node_entries = [
+                (node_id, node, self._node_locks.get(node_id))
+                for node_id, node in self.nodes.items()
+            ] #三元组：节点 ID NodeState 对象 该节点对应的锁
+
+        for node_id, node, lock in node_entries:
+            if lock is None:
+                continue
+            with lock:
+                matched_blocks = []
+                for prompt_tokens in batch_prompt_tokens:
+                    matched = 0
+                    node_block_size = node.block_size
+                    if node_block_size > 0:
+                        current_parent = None
+                        cursor = 0
+                        while cursor + node_block_size <= len(prompt_tokens):
+                            block_tokens = tuple(prompt_tokens[cursor : cursor + node_block_size])
+                            cursor += node_block_size
+                            block_hash = node.block_index.get((current_parent, block_tokens))
+                            if block_hash is None:
+                                break
+                            current_parent = block_hash
+                            matched += 1
+                    matched_blocks.append(matched)
+
+                scores[node_id] = NodeRoutingState(
+                    node_id=node_id,
+                    host=node.host,
+                    port=node.port,
+                    matched_prefix_blocks=tuple(matched_blocks),
+                    active_requests=node.active_requests,
+                    running_requests=node.running_requests,
+                    waiting_requests=node.waiting_requests,
+                    kv_cache_usage=node.kv_cache_usage,
+                    external_cache_queries=node.external_cache_queries,
+                    external_cache_hits=node.external_cache_hits,
+                    metrics_available=node.metrics_available,
+                    metrics_updated_at=node.metrics_updated_at,
+                    gpu_free_blocks=node.gpu_free_blocks,
+                    block_size=node.block_size,
+                )
+        return scores
 
     def update_active_requests(self, node_id: str, delta: int) -> None:
-        with self._lock:
-            node = self.nodes.get(node_id)
-            if node is not None:
+        node, lock = self._get_node_and_lock(node_id)
+        if node is not None and lock is not None:
+            with lock:
                 node.active_requests = max(0, node.active_requests + delta)
 
     def update_metrics_text(self, node_id: str, metrics_text: str) -> None:
@@ -156,7 +194,7 @@ class KareserveTracker:
                 sum,
             ),
         }
-        values: Dict[str, float] = {}
+        values: dict[str, float] = {}
         for field, (metric, reducer) in names.items():
             matches = re.findall(
                 rf"^{re.escape(metric)}(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)$",
@@ -165,19 +203,21 @@ class KareserveTracker:
             )
             if matches:
                 values[field] = reducer(float(value) for value in matches)
-        with self._lock:
+        with self._nodes_lock:
             node = self.nodes.get(node_id)
-            if node is None:
-                return
+            lock = self._node_locks.get(node_id)
+        if node is None or lock is None:
+            return
+        with lock:
             for field, value in values.items():
                 setattr(node, field, value)
             node.metrics_available = True
             node.metrics_updated_at = time.time()
 
     def mark_metrics_unavailable(self, node_id: str) -> None:
-        with self._lock:
-            node = self.nodes.get(node_id)
-            if node is not None:
+        node, lock = self._get_node_and_lock(node_id)
+        if node is not None and lock is not None:
+            with lock:
                 node.metrics_available = False
 
     @staticmethod
@@ -195,78 +235,81 @@ class KareserveTracker:
         if not hashes or block_size <= 0:
             return
 
+        node.block_size = block_size
         cursor = 0
         current_parent = parent_hash
         for block_hash in hashes:
             block_tokens = tuple(token_ids[cursor : cursor + block_size])
             cursor += block_size
-            parent = node.cached_blocks.get(current_parent)
-            parent_tokens = parent.full_prefix_tokens if parent is not None else ()
-            full_prefix = parent_tokens + block_tokens
             node.cached_blocks[block_hash] = CachedBlock(
                 block_hash=block_hash,
                 parent_block_hash=current_parent,
                 token_ids=block_tokens,
-                full_prefix_tokens=full_prefix,
                 medium=medium,
             )
+            node.block_index[(current_parent, block_tokens)] = block_hash
             node.cached_prefix_hashes.add(str(block_hash))
             current_parent = block_hash
 
     def _remove_event(self, node: NodeState, event: Any) -> None:
         for block_hash in self._event_value(event, "block_hashes", []):
-            node.cached_blocks.pop(block_hash, None)
+            block = node.cached_blocks.pop(block_hash, None)
+            if block is not None:
+                node.block_index.pop((block.parent_block_hash, block.token_ids), None)
             node.cached_prefix_hashes.discard(str(block_hash))
+
+    def _decode_batch(self, node_id: str, payload_bytes: bytes) -> Any:
+        preferred = self._decoder_index_by_node.get(node_id)
+        indexes = (preferred, 1 - preferred) if preferred is not None else (0, 1)
+        last_error: msgspec.DecodeError | None = None
+        for index in indexes:
+            try:
+                batch = self._decoders[index].decode(payload_bytes)
+                self._decoder_index_by_node[node_id] = index
+                return batch
+            except msgspec.DecodeError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
 
     def process_raw_payload(self, node_id: str, payload_bytes: bytes) -> None:
         try:
-            if self._decoders:
-                decode_error: Exception | None = None
-                for decoder in self._decoders:
-                    try:
-                        events = decoder.decode(payload_bytes).events
-                        break
-                    except Exception as exc:
-                        decode_error = exc
-                else:
-                    assert decode_error is not None
-                    raise decode_error
-            else:
-                events = json.loads(payload_bytes.decode("utf-8")).get("events", [])
-            with self._lock:
-                node = self.nodes.get(node_id)
-                if node is None:
-                    return
-                for event in events:
-                    event_name = type(event).__name__
-                    if isinstance(event, dict):
-                        event_name = event.get("type", "")
-                    if event_name in {
-                        "RawAllBlocksCleared",
-                        "RawMapAllBlocksCleared",
-                        "AllBlocksCleared",
-                    }:
-                        node.cached_blocks.clear()
-                        node.cached_prefix_hashes.clear()
-                    elif event_name in {
-                        "RawBlockRemoved",
-                        "RawMapBlockRemoved",
-                        "BlockRemoved",
-                    } or (
-                        isinstance(event, dict)
-                        and "medium" in event
-                        and "token_ids" not in event
-                    ):
-                        self._remove_event(node, event)
-                    else:
-                        self._store_event(node, event)
-        except Exception as exc:
+            batch = self._decode_batch(node_id, payload_bytes)
+        except msgspec.DecodeError as exc:
             logger.warning("Failed to decode vLLM KV event payload: %s", exc)
+            return
+
+        node, lock = self._get_node_and_lock(node_id)
+        if node is None or lock is None:
+            return
+
+        with lock:
+            for event in batch.events:
+                event_name = type(event).__name__
+                if isinstance(event, dict):
+                    event_name = event.get("type", "")
+                if event_name in {
+                    "RawAllBlocksCleared",
+                    "RawMapAllBlocksCleared",
+                    "AllBlocksCleared",
+                }:
+                    node.cached_blocks.clear()
+                    node.block_index.clear()
+                    node.cached_prefix_hashes.clear()
+                elif event_name in {
+                    "RawBlockRemoved",
+                    "RawMapBlockRemoved",
+                    "BlockRemoved",
+                } or (
+                    isinstance(event, dict)
+                    and "medium" in event
+                    and "token_ids" not in event
+                ):
+                    self._remove_event(node, event)
+                else:
+                    self._store_event(node, event)
 
     def start_zmq_listener(self, node_id: str, zmq_endpoint: str) -> None:
-        if not HAS_VLLM_EVENT_DEPS:
-            raise RuntimeError("msgspec and pyzmq are required for KV event tracking")
-
         def listener_loop() -> None:
             ctx = zmq.Context.instance()
             sock = ctx.socket(zmq.SUB)

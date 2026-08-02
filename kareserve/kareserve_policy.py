@@ -4,26 +4,22 @@
 import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
-
+from typing import Any
 
 @dataclass
 class SchedulerRequest:
     request_id: str
-    prompt_tokens: List[int]
-    prefix_hashes: List[str] = field(default_factory=list)
+    prompt_tokens: list[int]
+    prefix_hashes: list[str] = field(default_factory=list)
     max_tokens: int = 16
-    extra_body: Dict[str, Any] = field(default_factory=dict)
-
+    raw_body: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class CachedBlock:
     block_hash: bytes | int | str
     parent_block_hash: bytes | int | str | None
     token_ids: tuple[int, ...]
-    full_prefix_tokens: tuple[int, ...]
     medium: str = "GPU"
-
 
 @dataclass
 class NodeState:
@@ -41,10 +37,35 @@ class NodeState:
     metrics_available: bool = False
     metrics_updated_at: float = 0.0
     gpu_free_blocks: int = 1000
-    cached_prefix_hashes: Set[str] = field(default_factory=set)
-    cached_blocks: Dict[bytes | int | str, CachedBlock] = field(
+    cached_prefix_hashes: set[str] = field(default_factory=set)
+    cached_blocks: dict[bytes | int | str, CachedBlock] = field(
         default_factory=dict
     )
+    block_index: dict[tuple[bytes | int | str | None, tuple[int, ...]], bytes | int | str] = field(
+        default_factory=dict
+    )
+    block_size: int = 0
+
+    @property
+    def endpoint_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+@dataclass(frozen=True, slots=True)
+class NodeRoutingState:
+    node_id: str
+    host: str
+    port: int
+    matched_prefix_blocks: tuple[int, ...]
+    active_requests: int
+    running_requests: float
+    waiting_requests: float
+    kv_cache_usage: float
+    external_cache_queries: float
+    external_cache_hits: float
+    metrics_available: bool
+    metrics_updated_at: float
+    gpu_free_blocks: int
+    block_size: int
 
     @property
     def endpoint_url(self) -> str:
@@ -61,52 +82,42 @@ class NodeState:
             return 0.0
         return self.external_cache_hits / self.external_cache_queries
 
-    def longest_cached_prefix_tokens(self, prompt_tokens: List[int]) -> int:
-        if not prompt_tokens:
-            return 0
-        best = 0
-        prompt = tuple(prompt_tokens)
-        for block in self.cached_blocks.values():
-            prefix = block.full_prefix_tokens
-            if len(prefix) <= len(prompt) and prompt[: len(prefix)] == prefix:
-                best = max(best, len(prefix))
-        return best
-
-
 class KareserveBasePolicy(ABC):
     name = "base"
 
     @abstractmethod
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         pass
 
     def select_batch(
         self,
-        requests: List[SchedulerRequest],
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Dict[str, NodeState]:
+        requests: list[SchedulerRequest],
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> dict[str, NodeRoutingState]:
         """Assign a window while accounting for earlier assignments."""
         virtual_load = {
             node_id: node.observed_load for node_id, node in cluster_nodes.items()
         }
-        assignments: Dict[str, NodeState] = {}
+        assignments: dict[str, NodeRoutingState] = {}
         ordered = sorted(
-            requests,
-            key=lambda req: max(
+            range(len(requests)),
+            key=lambda req_idx: max(
                 (
-                    node.longest_cached_prefix_tokens(req.prompt_tokens)
+                    node.matched_prefix_blocks[req_idx]
                     for node in cluster_nodes.values()
                 ),
                 default=0,
             ),
             reverse=True,
         )
-        for request in ordered:
-            node = self.select_node_with_load(request, cluster_nodes, virtual_load)
+        for req_idx in ordered:
+            request = requests[req_idx]
+            node = self.select_node_with_load(req_idx, request, cluster_nodes, virtual_load)
             if node is None:
                 continue
             assignments[request.request_id] = node
@@ -115,14 +126,15 @@ class KareserveBasePolicy(ABC):
 
     def select_node_with_load(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-        virtual_load: Dict[str, float],
-    ) -> Optional[NodeState]:
-        return self.select_node(request, cluster_nodes)
+        cluster_nodes: dict[str, NodeRoutingState],
+        virtual_load: dict[str, float],
+    ) -> NodeRoutingState | None:
+        return self.select_node(req_idx, request, cluster_nodes)
 
     @staticmethod
-    def available_nodes(cluster_nodes: Dict[str, NodeState]) -> List[NodeState]:
+    def available_nodes(cluster_nodes: dict[str, NodeRoutingState]) -> list[NodeRoutingState]:
         nodes = list(cluster_nodes.values())
         available = [node for node in nodes if node.metrics_available]
         return available or nodes
@@ -130,7 +142,6 @@ class KareserveBasePolicy(ABC):
     @staticmethod
     def request_work(request: SchedulerRequest) -> float:
         return max(1.0, len(request.prompt_tokens) / 256.0)
-
 
 class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
     """Greedy prefix-affinity policy with per-window virtual load."""
@@ -160,8 +171,8 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         self.decode_token_weight = max(0.0, decode_token_weight)
 
     def _candidate_nodes(
-        self, cluster_nodes: Dict[str, NodeState]
-    ) -> List[NodeState]:
+        self, cluster_nodes: dict[str, NodeRoutingState]
+    ) -> list[NodeRoutingState]:
         nodes = self.available_nodes(cluster_nodes)
         below_limit = [
             node for node in nodes if node.kv_cache_usage < self.kv_cache_hard_limit
@@ -175,7 +186,7 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
             node for node in nodes if node.kv_cache_usage == minimum_usage
         ]
 
-    def _capacity_pressure(self, node: NodeState) -> float:
+    def _capacity_pressure(self, node: NodeRoutingState) -> float:
         usage = min(max(node.kv_cache_usage, 0.0), 1.0)
         if usage <= self.kv_cache_high_watermark:
             return 0.0
@@ -184,10 +195,10 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         return self.kv_cache_weight * normalized * normalized
 
     def _request_work_for_node(
-        self, request: SchedulerRequest, node: NodeState
+        self, req_idx: int, request: SchedulerRequest, node: NodeRoutingState
     ) -> float:
-        hit_tokens = node.longest_cached_prefix_tokens(request.prompt_tokens)
-        uncached_prompt_tokens = max(0, len(request.prompt_tokens) - hit_tokens)
+        hit_blocks = node.matched_prefix_blocks[req_idx]
+        uncached_prompt_tokens = max(0, len(request.prompt_tokens) - hit_blocks * node.block_size)
         weighted_tokens = (
             uncached_prompt_tokens
             + self.decode_token_weight * max(0, request.max_tokens)
@@ -199,13 +210,17 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
 
     def _score(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        node: NodeState,
+        node: NodeRoutingState,
         load: float,
     ) -> float:
-        hit_tokens = node.longest_cached_prefix_tokens(request.prompt_tokens)
-        affinity = hit_tokens / max(self.prefix_tokens_per_load_unit, 1.0)
-        projected_load = load + 0.5 * self._request_work_for_node(request, node)
+        hit_blocks = node.matched_prefix_blocks[req_idx]
+        affinity = (
+            hit_blocks * node.block_size
+            / max(self.prefix_tokens_per_load_unit, 1.0)
+        )
+        projected_load = load + 0.5 * self._request_work_for_node(req_idx, request, node)
         return (
             affinity
             - self.queue_weight * projected_load
@@ -214,50 +229,53 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
 
     def select_node_with_load(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-        virtual_load: Dict[str, float],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+        virtual_load: dict[str, float],
+    ) -> NodeRoutingState | None:
         candidates = self._candidate_nodes(cluster_nodes)
         if not candidates:
             return None
         return max(
             candidates,
             key=lambda node: self._score(
-                request, node, virtual_load.get(node.node_id, node.observed_load)
+                req_idx, request, node, virtual_load.get(node.node_id, node.observed_load)
             ),
         )
 
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         return self.select_node_with_load(
+            req_idx,
             request,
             cluster_nodes,
             {node_id: node.observed_load for node_id, node in cluster_nodes.items()},
         )
 
     def _shared_prefix_groups(
-        self, requests: List[SchedulerRequest]
-    ) -> List[List[SchedulerRequest]]:
-        prefix_counts: Dict[tuple[int, ...], int] = {}
-        request_prefixes: Dict[str, List[tuple[int, ...]]] = {}
+        self, requests: list[SchedulerRequest], block_size: int = 16
+    ) -> list[list[SchedulerRequest]]:
+        prefix_counts: dict[tuple[int, ...], int] = {}
+        request_prefixes: dict[str, list[tuple[int, ...]]] = {}
         for request in requests:
             prefixes = []
             for end in range(
-                self.group_block_size,
+                block_size,
                 len(request.prompt_tokens) + 1,
-                self.group_block_size,
+                block_size,
             ):
                 prefix = tuple(request.prompt_tokens[:end])
                 prefixes.append(prefix)
                 prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
             request_prefixes[request.request_id] = prefixes
 
-        groups: Dict[
-            tuple[int, ...] | tuple[str, str], List[SchedulerRequest]
+        groups: dict[
+            tuple[int, ...] | tuple[str, str], list[SchedulerRequest]
         ] = {}
         for request in requests:
             shared = [
@@ -279,24 +297,32 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
 
     def select_batch(
         self,
-        requests: List[SchedulerRequest],
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Dict[str, NodeState]:
+        requests: list[SchedulerRequest],
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> dict[str, NodeRoutingState]:
         candidates = self._candidate_nodes(cluster_nodes)
         if not candidates:
             return {}
         virtual_load = {
             node_id: node.observed_load for node_id, node in cluster_nodes.items()
         }
-        assignments: Dict[str, NodeState] = {}
-        for group in self._shared_prefix_groups(requests):
+        assignments: dict[str, NodeRoutingState] = {}
+
+        # Build mapping from request_id to request index for O(1) lookup
+        req_idx_map = {req.request_id: i for i, req in enumerate(requests)}
+
+        # Assuming homogeneous block size across the cluster for grouping
+        block_size = next(
+            (node.block_size for node in candidates if node.block_size > 0),
+            self.group_block_size,
+        )
+
+        for group in self._shared_prefix_groups(requests, block_size):
             node = max(
                 candidates,
                 key=lambda candidate: (
                     sum(
-                        candidate.longest_cached_prefix_tokens(
-                            request.prompt_tokens
-                        )
+                        candidate.matched_prefix_blocks[req_idx_map[request.request_id]]
                         for request in group
                     )
                     / max(self.prefix_tokens_per_load_unit, 1.0)
@@ -305,7 +331,7 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
                         virtual_load[candidate.node_id]
                         + 0.5
                         * sum(
-                            self._request_work_for_node(request, candidate)
+                            self._request_work_for_node(req_idx_map[request.request_id], request, candidate)
                             for request in group
                         )
                     )
@@ -315,10 +341,9 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
             for request in group:
                 assignments[request.request_id] = node
                 virtual_load[node.node_id] += self._request_work_for_node(
-                    request, node
+                    req_idx_map[request.request_id], request, node
                 )
         return assignments
-
 
 class ExampleTemplatePolicy(KareserveBasePolicy):
     """Compatibility policy retained for existing experiments."""
@@ -331,9 +356,10 @@ class ExampleTemplatePolicy(KareserveBasePolicy):
 
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         nodes = self.available_nodes(cluster_nodes)
         if not nodes:
             return None
@@ -341,27 +367,20 @@ class ExampleTemplatePolicy(KareserveBasePolicy):
             nodes,
             key=lambda node: (
                 self.weight_prefix
-                * (
-                    node.longest_cached_prefix_tokens(request.prompt_tokens)
-                    or sum(
-                        1
-                        for value in request.prefix_hashes
-                        if value in node.cached_prefix_hashes
-                    )
-                )
+                * node.matched_prefix_blocks[req_idx]
                 - self.weight_queue * node.observed_load
             ),
         )
-
 
 class LeastLoadPolicy(KareserveBasePolicy):
     name = "least_load"
 
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         nodes = self.available_nodes(cluster_nodes)
         if not nodes:
             return None
@@ -369,10 +388,11 @@ class LeastLoadPolicy(KareserveBasePolicy):
 
     def select_node_with_load(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-        virtual_load: Dict[str, float],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+        virtual_load: dict[str, float],
+    ) -> NodeRoutingState | None:
         nodes = self.available_nodes(cluster_nodes)
         if not nodes:
             return None
@@ -386,21 +406,20 @@ class LeastLoadPolicy(KareserveBasePolicy):
 
     def select_batch(
         self,
-        requests: List[SchedulerRequest],
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Dict[str, NodeState]:
+        requests: list[SchedulerRequest],
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> dict[str, NodeRoutingState]:
         virtual_load = {
             node_id: node.observed_load for node_id, node in cluster_nodes.items()
         }
-        assignments: Dict[str, NodeState] = {}
-        for request in requests:
-            node = self.select_node_with_load(request, cluster_nodes, virtual_load)
+        assignments: dict[str, NodeRoutingState] = {}
+        for req_idx, request in enumerate(requests):
+            node = self.select_node_with_load(req_idx, request, cluster_nodes, virtual_load)
             if node is None:
                 continue
             assignments[request.request_id] = node
             virtual_load[node.node_id] += self.request_work(request)
         return assignments
-
 
 class RoundRobinPolicy(KareserveBasePolicy):
     """Deterministic request-order round robin baseline."""
@@ -412,9 +431,10 @@ class RoundRobinPolicy(KareserveBasePolicy):
 
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         nodes = sorted(
             self.available_nodes(cluster_nodes), key=lambda node: node.node_id
         )
@@ -426,16 +446,15 @@ class RoundRobinPolicy(KareserveBasePolicy):
 
     def select_batch(
         self,
-        requests: List[SchedulerRequest],
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Dict[str, NodeState]:
-        assignments: Dict[str, NodeState] = {}
-        for request in requests:
-            node = self.select_node(request, cluster_nodes)
+        requests: list[SchedulerRequest],
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> dict[str, NodeRoutingState]:
+        assignments: dict[str, NodeRoutingState] = {}
+        for req_idx, request in enumerate(requests):
+            node = self.select_node(req_idx, request, cluster_nodes)
             if node is not None:
                 assignments[request.request_id] = node
         return assignments
-
 
 class PrefixHashPolicy(KareserveBasePolicy):
     """Stable prefix-to-node mapping baseline."""
@@ -447,9 +466,10 @@ class PrefixHashPolicy(KareserveBasePolicy):
 
     def select_node(
         self,
+        req_idx: int,
         request: SchedulerRequest,
-        cluster_nodes: Dict[str, NodeState],
-    ) -> Optional[NodeState]:
+        cluster_nodes: dict[str, NodeRoutingState],
+    ) -> NodeRoutingState | None:
         nodes = sorted(
             self.available_nodes(cluster_nodes), key=lambda node: node.node_id
         )
@@ -461,13 +481,12 @@ class PrefixHashPolicy(KareserveBasePolicy):
         index = int.from_bytes(digest, byteorder="big") % len(nodes)
         return nodes[index]
 
-
 class KareserveMediumAwarePolicy(WindowedPrefixAffinityPolicy):
     """Compatibility wrapper for the original hardware-profile constructor."""
 
     name = "medium_aware"
 
-    def __init__(self, hardware_profile: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, hardware_profile: dict[str, Any] | None = None) -> None:
         profile = hardware_profile or {}
         self.gpu_flops = profile.get("gpu_flops_tflops", 312.0) * 1e12
         self.model_params = profile.get("model_params_billions", 7.0) * 1e9
