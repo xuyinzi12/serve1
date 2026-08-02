@@ -15,15 +15,15 @@ nvidia-smi
 
 ## 2. 理解端口
 
-单个vLLM实例同时开放两个项目端口：
+单个vLLM实例开放三个项目端口：
 
 ```text
-GPU0  HTTP 8101  KV Event 5557
-GPU1  HTTP 8102  KV Event 5558
-GPU2  HTTP 8103  KV Event 5559
+GPU0  HTTP 8101  KV Event 5557  Replay 6557
+GPU1  HTTP 8102  KV Event 5558  Replay 6558
+GPU2  HTTP 8103  KV Event 5559  Replay 6559
 ```
 
-HTTP端口接收`/tokenize`、`/v1/completions`和`/metrics`。KV Event端口通过ZMQ发布GPU缓存块的Store、Remove和Clear事件。LMCache使用ZMQ 5555提供KV操作，并使用HTTP 8080提供管理与健康检查。Router使用HTTP 8090接收Benchmark请求。
+HTTP端口接收推理请求并提供`/metrics`。KV Event端口通过ZMQ发布GPU缓存块的Store、Remove和Clear事件。Replay端口补发发布端仍保留的事件。LMCache使用ZMQ 5555提供KV操作，并使用HTTP 8080提供管理与健康检查。Router使用HTTP 8090接收Benchmark请求，并在本地执行Tokenization。
 
 ## 3. 执行单GPU连通性测试
 
@@ -135,6 +135,8 @@ GPU_IDS=1 bash scripts/experiment/verify_lmcache_persistence.sh
 ```
 
 第一阶段负责Store，第二阶段负责Retrieve。第二阶段的`external_prefix_cache_hits_total`增长构成CPU KVCache复用证据。
+
+LMCache MP Connector当前不发布CPU L1块级Store和Evict事件。Router在请求成功完成后登记完整外部缓存Chunk，并把该目录用于路由成本估算。`/routing/state`中的`monitoring`保存vLLM实际Lookup与命中累计值，`cache_catalog.external_source`标明预测目录来源。vLLM Connector对每个请求执行最终Lookup。
 
 ## 9. 手工调试
 

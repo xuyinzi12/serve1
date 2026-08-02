@@ -2188,6 +2188,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "msgspec" },
     { name = "pyzmq" },
+    { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -2204,6 +2205,7 @@ requires-dist = [
     { name = "lmcache", marker = "extra == 'runtime'", specifier = "==0.5.2" },
     { name = "msgspec", specifier = ">=0.18,<1" },
     { name = "pyzmq", specifier = ">=25,<28" },
+    { name = "transformers", specifier = ">=5,<6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29,<1" },
     { name = "vllm", marker = "extra == 'runtime'", specifier = "==0.26.0" },
 ]

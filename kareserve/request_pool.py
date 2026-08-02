@@ -1,29 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded aggregation window for cluster-level request assignment."""
 
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from kareserve.kareserve_policy import (
-    KareserveBasePolicy,
+from kareserve.kareserve_policy import KareserveBasePolicy
+from kareserve.kareserve_state import (
     NodeRoutingState,
+    PrefixMatch,
     SchedulerRequest,
 )
 from kareserve.kareserve_tracker import KareserveTracker
 
-@dataclass
+
+@dataclass(slots=True)
 class PendingRequest:
     request: SchedulerRequest
-    future: asyncio.Future["AssignmentResult"]
+    future: asyncio.Future[AssignmentResult]
     queued_at: float
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class AssignmentResult:
     node: NodeRoutingState
+    prefix_match: PrefixMatch
     route_batch_size: int
     queue_wait_ms: float
-    prefix_hit_blocks: int
+    inflight_work: float
+    estimated_cost: float
+
 
 class RequestPool:
     def __init__(
@@ -47,7 +55,7 @@ class RequestPool:
 
     def start(self) -> None:
         if self._task is None:
-            self._task = asyncio.create_task(self._run())
+            self._task = asyncio.create_task(self._run(), name="kareserve-request-pool")
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -94,32 +102,40 @@ class RequestPool:
                     batch.append(await asyncio.wait_for(self.queue.get(), timeout))
                 except asyncio.TimeoutError:
                     break
-            self._flush(batch)
+            try:
+                self._flush(batch)
+            except Exception as exc:  # noqa: BLE001
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(exc)
 
     def _flush(self, batch: list[PendingRequest]) -> None:
         flushed_at = asyncio.get_running_loop().time()
         requests = [item.request for item in batch]
-        assignments = self.policy.select_batch(
-            requests,
-            self.tracker.get_routing_states(
-                [req.prompt_tokens for req in requests]
-            ),
+        candidates = self.tracker.build_route_candidates(
+            requests, self.group_block_size
         )
+        assignments = self.policy.select_batch(requests, candidates)
         self.total_batches += 1
         self.total_requests += len(batch)
         self.last_batch_size = len(batch)
-        for req_idx, item in enumerate(batch):
-            node = assignments.get(item.request.request_id)
-            if node is None:
+
+        for item in batch:
+            if item.future.cancelled():
+                continue
+            assignment = assignments.get(item.request.request_id)
+            if assignment is None:
                 item.future.set_exception(RuntimeError("No available vLLM server"))
-            else:
-                item.future.set_result(
-                    AssignmentResult(
-                        node=node,
-                        route_batch_size=len(batch),
-                        queue_wait_ms=max(
-                            0.0, (flushed_at - item.queued_at) * 1000.0
-                        ),
-                        prefix_hit_blocks=node.matched_prefix_blocks[req_idx],
-                    )
+                continue
+            candidate = assignment.candidate
+            self.tracker.reserve_route(candidate.node.node_id, assignment.inflight_work)
+            item.future.set_result(
+                AssignmentResult(
+                    node=candidate.node,
+                    prefix_match=candidate.prefix_match,
+                    route_batch_size=len(batch),
+                    queue_wait_ms=max(0.0, (flushed_at - item.queued_at) * 1000.0),
+                    inflight_work=assignment.inflight_work,
+                    estimated_cost=assignment.estimated_cost,
                 )
+            )

@@ -8,11 +8,10 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-
 GPU_PORTS = {
-    0: (8101, 5557),
-    1: (8102, 5558),
-    2: (8103, 5559),
+    0: (8101, 5557, 6557),
+    1: (8102, 5558, 6558),
+    2: (8103, 5559, 6559),
 }
 
 
@@ -48,20 +47,26 @@ def main() -> None:
 
     expected = {GPU_PORTS[gpu] for gpu in args.gpu_ids}
     actual = {
-        (int(node["port"]), endpoint_port(node["kv_events_endpoint"]))
+        (
+            int(node["port"]),
+            endpoint_port(node["kv_events_endpoint"]),
+            endpoint_port(node["kv_replay_endpoint"]),
+        )
         for node in nodes
     }
     if actual != expected:
         raise ValueError(
-            f"Router ports {sorted(actual)} do not match GPU ports "
-            f"{sorted(expected)}"
+            f"Router ports {sorted(actual)} do not match GPU ports {sorted(expected)}"
         )
 
     node_ids = [str(node["node_id"]) for node in nodes]
     if len(set(node_ids)) != len(node_ids):
         raise ValueError("Router node IDs must be unique")
-    if config.get("tokenizer_node_id") not in node_ids:
-        raise ValueError("tokenizer_node_id must reference a configured node")
+    missing_domains = [
+        node["node_id"] for node in nodes if not node.get("cache_domain_id")
+    ]
+    if missing_domains:
+        raise ValueError(f"Nodes are missing cache_domain_id: {missing_domains}")
 
     print(
         json.dumps(
@@ -69,7 +74,7 @@ def main() -> None:
                 "config": str(config_path),
                 "gpu_ids": args.gpu_ids,
                 "nodes": node_ids,
-                "tokenizer_node_id": config["tokenizer_node_id"],
+                "cache_domains": sorted({node["cache_domain_id"] for node in nodes}),
             },
             sort_keys=True,
         )

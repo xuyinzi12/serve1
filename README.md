@@ -23,7 +23,7 @@ docs/               架构与实验说明
 Benchmark / Client
         ↓
 KaReserve Router
-  1. 调用 vLLM /tokenize
+  1. 使用本地 Tokenizer生成 Token IDs
   2. 进入短时 Request Pool
   3. 执行窗口级路由策略
   4. 转发到目标 vLLM
@@ -33,7 +33,6 @@ vLLM Continuous Batching
 
 Router 提供以下接口：
 
-- `POST /tokenize`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `GET /health`
@@ -70,9 +69,9 @@ Completion 响应包含目标实例、路由策略、窗口大小、Router 等�
 }
 ```
 
-`windowed_prefix` 将 GPU 本地命中 token 换算为复用收益，将运行请求、等待请求和窗口内新增工作换算为负载代价。窗口内新增工作使用目标实例未命中的 Prompt token 和加权 Decode token 计算。`kv_cache_high_watermark` 以上的容量占用产生二次增长惩罚；存在低于 `kv_cache_hard_limit` 的实例时，高于该阈值的实例退出候选集；全部实例超过阈值时，Router 选择占用最低的实例。vLLM `/metrics` 拉取失败的实例在存在健康实例时退出候选集。
+`windowed_prefix` 将不同缓存介质的命中 token 换算为复用成本，将运行队列、Router在途工作和窗口内新增工作换算为负载代价。窗口内新增工作使用目标实例未命中的 Prompt token 和加权 Decode token 计算。`kv_cache_high_watermark` 以上的容量占用产生二次增长惩罚；存在低于 `kv_cache_hard_limit` 的实例时，高于该阈值的实例退出候选集；全部实例超过阈值时，Router 选择占用最低的实例。vLLM `/metrics` 拉取失败的实例在存在健康实例时退出候选集。
 
-所有实例连接同一个 LMCache MP Server 时，LMCache CPU 命中对实例排序构成共享条件。Router 使用 GPU 本地 Prefix 和实例负载完成选点，目标 vLLM Connector 执行 LMCache Lookup 和 Load。
+Router通过 vLLM KV Event维护GPU缓存目录，通过成功完成的请求维护LMCache预测目录。共享`cache_domain_id`的实例共享同一外部缓存位置。目标vLLM Connector执行最终LMCache Lookup和Load，实际命中量通过vLLM指标进入监控状态。
 
 ## 硬件测速
 
@@ -99,7 +98,7 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 }
 ```
 
-当前路由策略输出该 Profile用于实验记录。共享 LMCache场景中的实例排序暂不使用 H2D参数。后续加入外部缓存请求级目录后，Router使用该 Profile估算 LMCache加载时间。
+当前路由策略使用该 Profile估算CPU到GPU加载成本。Profile缺少完整模型与硬件字段时，策略使用归一化成本模型。
 
 ## 运行环境
 
@@ -113,7 +112,7 @@ CPU 到 GPU 的 KVCache 加载路径使用 pinned host-to-device 测速。脚本
 
 ## 调试启动
 
-调试脚本只支持 GPU 0、GPU 1、GPU 2。每张 GPU 对应独立的 HTTP 端口和 KV Event 端口。
+调试脚本只支持 GPU 0、GPU 1、GPU 2。每张 GPU 对应独立的 HTTP、KV Event和事件Replay端口。
 
 ```bash
 cd /home/zn/xyz/serve1
@@ -170,10 +169,10 @@ GPU_IDS=1 \
 bash scripts/debug/start_vllm_cluster.sh
 ```
 
-LMCache Server默认监听ZMQ端口`127.0.0.1:5555`和HTTP管理端口`127.0.0.1:8080`，CPU L1默认容量为32 GiB，淘汰策略为LRU。vLLM使用`LMCacheMPConnector`、`kv_both`角色和非Hybrid KV Cache Manager。`scripts/debug/lmcache_probe.py`提供确定性长Prefix请求和缓存指标输出。KaReserve从各vLLM`/metrics`读取LMCache查询量和命中量，并通过`/routing/state`输出累计命中率。
+LMCache Server默认监听ZMQ端口`127.0.0.1:5555`和HTTP管理端口`127.0.0.1:8080`，CPU L1默认容量为32 GiB，淘汰策略为LRU。vLLM使用`LMCacheMPConnector`、`kv_both`角色和非Hybrid KV Cache Manager。`scripts/debug/lmcache_probe.py`提供确定性长Prefix请求和缓存指标输出。KaReserve从各vLLM`/metrics`读取LMCache查询量和命中量，并通过`/routing/state`输出累计值。
 
 `scripts/experiment/verify_lmcache_persistence.sh`保持LMCache Server运行并重启vLLM，验证KVCache跨vLLM进程Store和Retrieve。
 
 ## 项目边界
 
-KaReserve 管理请求窗口、Prefix逻辑分组、GPU本地 Prefix感知、容量与负载感知选点和 HTTP转发。vLLM 管理执行批次和 GPU KVCache。LMCache通过 vLLM KV Connector管理共享 CPU KVCache。当前单机路由不执行 GPU间 KVCache传输，也不在转发前调用 LMCache Lookup。vLLM连接器负责实际请求的 LMCache命中查询、加载和缓存锁生命周期。
+KaReserve管理请求窗口、Prefix逻辑分组、多介质Prefix目录、容量与负载感知选点和HTTP转发。vLLM管理执行批次和GPU KVCache。LMCache通过vLLM KV Connector管理共享CPU KVCache。当前单机路由不执行GPU间KVCache传输，也不在转发前调用LMCache Lookup。vLLM连接器负责实际请求的LMCache命中查询、加载和缓存锁生命周期。LMCache MP Connector当前缺少CPU L1块级Store和Evict事件，Router的外部缓存目录来自成功请求的准入记录，目录允许陈旧，实际命中指标构成执行结果。

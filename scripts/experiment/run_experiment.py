@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -31,7 +30,7 @@ def run(command: list[str], env: dict[str, str], dry_run: bool) -> None:
 
 def package_versions() -> dict[str, str]:
     versions = {}
-    for name in ("vllm", "torch", "lmcache", "numpy"):
+    for name in ("vllm", "torch", "lmcache", "transformers", "numpy"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -72,9 +71,7 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
         "KARESERVE_MODEL": runtime["model"],
         "KARESERVE_MODEL_NAME": runtime["model_name"],
         "KARESERVE_DTYPE": runtime.get("dtype", "half"),
-        "KARESERVE_GPU_MEMORY_UTILIZATION": runtime.get(
-            "gpu_memory_utilization", 0.5
-        ),
+        "KARESERVE_GPU_MEMORY_UTILIZATION": runtime.get("gpu_memory_utilization", 0.5),
         "KARESERVE_DATASET_NAME": benchmark["dataset_name"],
         "KARESERVE_DATASET_PATH": benchmark.get("dataset_path"),
         "KARESERVE_NUM_PROMPTS": benchmark["num_prompts"],
@@ -88,9 +85,7 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
             "ready_check_timeout_seconds", 0
         ),
         "KARESERVE_TRACE_CHUNK_SIZE": benchmark.get("trace_chunk_size", 16),
-        "KARESERVE_TRACE_SEC_MULTIPLIER": benchmark.get(
-            "trace_sec_multiplier", 1
-        ),
+        "KARESERVE_TRACE_SEC_MULTIPLIER": benchmark.get("trace_sec_multiplier", 1),
         "KARESERVE_PREFIX_LEN": benchmark.get("prefix_len", 512),
         "KARESERVE_SUFFIX_LEN": benchmark.get("suffix_len", 64),
         "KARESERVE_NUM_PREFIXES": benchmark.get("num_prefixes", 8),
@@ -98,12 +93,10 @@ def build_environment(manifest: dict[str, Any], run_dir: Path) -> dict[str, str]
         "KARESERVE_RESULT_DIR": str(run_dir),
         "KARESERVE_RESULT_FILENAME": "result.json",
         "KARESERVE_BENCH_LABEL": manifest["name"],
-        "KARESERVE_POLICY_OVERRIDE": manifest.get("router_overrides", {}).get(
-            "policy"
+        "KARESERVE_POLICY_OVERRIDE": manifest.get("router_overrides", {}).get("policy"),
+        "KARESERVE_WINDOW_MS_OVERRIDE": manifest.get("router_overrides", {}).get(
+            "window_ms"
         ),
-        "KARESERVE_WINDOW_MS_OVERRIDE": manifest.get(
-            "router_overrides", {}
-        ).get("window_ms"),
         "PYTHONHASHSEED": 0,
     }
     for name, value in mappings.items():
@@ -204,8 +197,7 @@ def main() -> None:
             )
             if not args.dry_run:
                 (run_dir / "router-state.json").write_text(
-                    json.dumps(read_router_state(), indent=2, sort_keys=True)
-                    + "\n",
+                    json.dumps(read_router_state(), indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
         finally:

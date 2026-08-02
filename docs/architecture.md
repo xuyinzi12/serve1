@@ -22,11 +22,15 @@ KaReserve Router
   CPU KVCache
 ```
 
-Router 使用 vLLM `/tokenize`获得 Token IDs，使用 KV Event维护实例 GPU Prefix目录，使用 `/metrics`维护运行请求、等待请求、KVCache占用和外部缓存累计命中状态。Router 的 `windowed_prefix` 策略使用 GPU本地 Prefix复用收益、实例负载、窗口虚拟工作量和 KVCache容量压力完成联合选点。
+Router在本地加载与vLLM一致的Tokenizer和Chat Template，并生成准确Token IDs。Router使用KV Event维护实例GPU Prefix目录，使用事件序号检测缺口，使用Replay端点补发发布端仍保留的事件。Router使用`/metrics`维护运行队列、KVCache容量、进程代次和外部缓存累计命中状态。vLLM进程代次变化会清除该实例的GPU目录，外部缓存域目录继续保留。
 
-Prefix组表示窗口内具有公共 Token Prefix的一组请求。组内请求获得同一个目标实例，Router仍然逐请求转发，vLLM决定实际执行批次。当前实现不提供首次并发 Miss合并，也不提供 GPU间 KVCache传输。
+`NodeState`保存完整可观测状态，`NodeRoutingState`只保存策略使用的请求无关决策特征，`PrefixMatch`保存当前请求在GPU和外部缓存中的连续命中长度。Router在分配时同时登记请求数量和预计在途工作量，并在响应结束后释放。
 
-LMCache Lookup与Load发生在请求进入目标 vLLM之后。所有本机 vLLM连接同一个 LMCache MP Server时，CPU缓存命中构成实例间共享条件。Router当前不使用 LMCache命中状态区分本机实例。
+Prefix组表示窗口内具有公共Token Prefix的一组请求。组内请求获得同一个目标实例，Router仍然逐请求转发，vLLM决定实际执行批次。当前实现不提供首次并发Miss合并，也不提供GPU间KVCache传输。
+
+LMCache Lookup与Load发生在请求进入目标vLLM之后。LMCache MP Connector 0.5.2不发布CPU L1块级Store和Evict事件，HTTP管理接口也不提供无副作用的L1 Prefix Lookup。Router在请求成功完成后登记完整外部缓存Chunk，并将其作为预测目录。共享`cache_domain_id`的实例共享该目录。目录可能因LRU淘汰产生陈旧项，目标vLLM Connector负责最终命中校验，vLLM外部缓存指标记录实际结果。
+
+`windowed_prefix`策略使用GPU直接复用成本、外部缓存加载成本、未命中计算成本、实例队列、Router在途工作和GPU容量压力完成窗口级选点。完整Hardware Profile提供H2D带宽和模型计算参数，缺失字段触发归一化成本模型。
 
 ## 多实体架构
 

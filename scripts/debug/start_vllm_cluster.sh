@@ -20,9 +20,11 @@ start_vllm() {
   local gpu="$1"
   local http_port="$2"
   local event_port="$3"
-  local name="$4"
+  local replay_port="$4"
+  local name="$5"
   local -a kv_args=()
   local -a chat_args=()
+  local -a cache_args=()
 
   if [[ "${KARESERVE_LMCACHE_MP:-0}" == "1" ]]; then
     kv_args=(
@@ -33,6 +35,11 @@ start_vllm() {
   fi
   if [[ -n "$CHAT_TEMPLATE" ]]; then
     chat_args=(--chat-template "$CHAT_TEMPLATE")
+  fi
+  if [[ -n "${KARESERVE_NUM_GPU_BLOCKS_OVERRIDE:-}" ]]; then
+    cache_args=(
+      --num-gpu-blocks-override "$KARESERVE_NUM_GPU_BLOCKS_OVERRIDE"
+    )
   fi
 
   if [[ -f "$RUNTIME/pids/$name.pid" ]] &&
@@ -56,8 +63,9 @@ start_vllm() {
     --enable-prefix-caching \
     "${chat_args[@]}" \
     "${kv_args[@]}" \
+    "${cache_args[@]}" \
     --kv-events-config \
-    "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:$event_port\"}" \
+    "{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://*:$event_port\",\"replay_endpoint\":\"tcp://*:$replay_port\"}" \
     >"$RUNTIME/logs/$name.log" 2>&1 &
   echo "$!" >"$RUNTIME/pids/$name.pid"
   echo "started $name pid=$!"
@@ -65,9 +73,9 @@ start_vllm() {
 
 for gpu in ${GPU_IDS:-0 1}; do
   case "$gpu" in
-    0) start_vllm 0 8101 5557 vllm-gpu0 ;;
-    1) start_vllm 1 8102 5558 vllm-gpu1 ;;
-    2) start_vllm 2 8103 5559 vllm-gpu2 ;;
+    0) start_vllm 0 8101 5557 6557 vllm-gpu0 ;;
+    1) start_vllm 1 8102 5558 6558 vllm-gpu1 ;;
+    2) start_vllm 2 8103 5559 6559 vllm-gpu2 ;;
     *)
       echo "unsupported debug GPU: $gpu" >&2
       exit 2

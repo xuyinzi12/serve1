@@ -1,44 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 """OpenAI-compatible Kareserve routing gateway."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import uuid
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from kareserve.kareserve_policy import (
+    CostModel,
     KareserveBasePolicy,
     LeastLoadPolicy,
-    NodeState,
     PrefixHashPolicy,
     RoundRobinPolicy,
-    SchedulerRequest,
     WindowedPrefixAffinityPolicy,
-    NodeRoutingState,
 )
+from kareserve.kareserve_state import NodeRoutingState, NodeState, SchedulerRequest
+from kareserve.kareserve_tokenizer import LocalRequestTokenizer
 from kareserve.kareserve_tracker import KareserveTracker
-from kareserve.request_pool import RequestPool
+from kareserve.request_pool import AssignmentResult, RequestPool
 
 logger = logging.getLogger("kareserve.server")
 logging.basicConfig(level=logging.INFO)
 
-@dataclass
+
+@dataclass(slots=True)
 class RouterConfig:
-    tokenizer_node_id: str
     nodes: list[dict[str, Any]]
+    tokenizer_path: str
+    tokenizer_revision: str | None = None
+    tokenizer_trust_remote_code: bool = False
+    chat_template_path: str | None = None
+    allow_request_chat_template: bool = False
+    external_cache_enabled: bool = False
+    external_cache_chunk_size: int = 256
     policy: str = "windowed_prefix"
     window_ms: float = 2.0
     max_batch_size: int = 64
     metrics_interval_seconds: float = 0.5
+    expected_output_tokens: int = 16
     prefix_tokens_per_load_unit: float = 256.0
     queue_weight: float = 1.0
     group_block_size: int = 16
@@ -49,60 +60,81 @@ class RouterConfig:
     prefix_hash_tokens: int = 256
     hardware_profile: dict[str, Any] = field(default_factory=dict)
 
-def build_policy(config: RouterConfig) -> KareserveBasePolicy:
-    policy_name = config.policy.lower()
-    if policy_name == "windowed_prefix":
-        return WindowedPrefixAffinityPolicy(
-            prefix_tokens_per_load_unit=config.prefix_tokens_per_load_unit,
-            queue_weight=config.queue_weight,
-            group_block_size=config.group_block_size,
-            kv_cache_weight=config.kv_cache_weight,
-            kv_cache_high_watermark=config.kv_cache_high_watermark,
-            kv_cache_hard_limit=config.kv_cache_hard_limit,
-            decode_token_weight=config.decode_token_weight,
-        )
-    if policy_name == "round_robin":
-        return RoundRobinPolicy()
-    if policy_name == "prefix_hash":
-        return PrefixHashPolicy(prefix_hash_tokens=config.prefix_hash_tokens)
-    if policy_name == "least_load":
-        return LeastLoadPolicy()
-    raise ValueError(f"Unsupported routing policy: {policy_name}")
+
+def _resolve_optional_path(value: str | None, config_path: Path) -> str | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (config_path.parent / path).resolve()
+    return str(path)
+
+
+def _resolve_model_reference(value: str, config_path: Path) -> str:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path)
+    local_path = (config_path.parent / path).resolve()
+    return str(local_path) if local_path.exists() else value
+
 
 def load_config(config_path: str) -> RouterConfig:
-    path = Path(config_path)
+    path = Path(config_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Router configuration does not exist: {path}")
-
-    with path.open("r", encoding="utf-8") as file:
-        data = json.load(file)
+    data = json.loads(path.read_text(encoding="utf-8"))
 
     nodes = data.get("nodes", [])
     if not nodes:
         raise ValueError("Router configuration must contain at least one node")
-
     node_ids = {node["node_id"] for node in nodes}
     if len(node_ids) != len(nodes):
         raise ValueError("Router node_id values must be unique")
 
-    tokenizer_node_id = data.get("tokenizer_node_id")
-    if tokenizer_node_id not in node_ids:
+    tokenizer = data.get("tokenizer", {})
+    tokenizer_path = (
+        os.environ.get("KARESERVE_TOKENIZER_PATH")
+        or os.environ.get("KARESERVE_MODEL")
+        or tokenizer.get("path")
+    )
+    if not tokenizer_path:
         raise ValueError(
-            "tokenizer_node_id must identify one configured Router node"
+            "Tokenizer path must be set by tokenizer.path, "
+            "KARESERVE_TOKENIZER_PATH, or KARESERVE_MODEL"
         )
+    tokenizer_path = _resolve_model_reference(tokenizer_path, path)
 
+    configured_template = os.environ.get("KARESERVE_CHAT_TEMPLATE") or tokenizer.get(
+        "chat_template_path"
+    )
     routing = data.get("routing", {})
     policy_override = os.environ.get("KARESERVE_POLICY_OVERRIDE")
     window_override = os.environ.get("KARESERVE_WINDOW_MS_OVERRIDE")
-
     return RouterConfig(
-        tokenizer_node_id=tokenizer_node_id,
         nodes=nodes,
+        tokenizer_path=tokenizer_path,
+        tokenizer_revision=tokenizer.get("revision"),
+        tokenizer_trust_remote_code=bool(tokenizer.get("trust_remote_code", False)),
+        chat_template_path=_resolve_optional_path(configured_template, path),
+        allow_request_chat_template=bool(
+            tokenizer.get("allow_request_chat_template", False)
+        ),
+        external_cache_enabled=(os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"),
+        external_cache_chunk_size=max(
+            1, int(routing.get("external_cache_chunk_size", 256))
+        ),
         policy=policy_override or routing.get("policy", "windowed_prefix"),
-        window_ms=float(window_override) if window_override is not None else float(routing.get("window_ms", 2.0)),
+        window_ms=(
+            float(window_override)
+            if window_override is not None
+            else float(routing.get("window_ms", 2.0))
+        ),
         max_batch_size=int(routing.get("max_batch_size", 64)),
         metrics_interval_seconds=float(routing.get("metrics_interval_seconds", 0.5)),
-        prefix_tokens_per_load_unit=float(routing.get("prefix_tokens_per_load_unit", 256.0)),
+        expected_output_tokens=max(0, int(routing.get("expected_output_tokens", 16))),
+        prefix_tokens_per_load_unit=float(
+            routing.get("prefix_tokens_per_load_unit", 256.0)
+        ),
         queue_weight=float(routing.get("queue_weight", 1.0)),
         group_block_size=int(routing.get("group_block_size", 16)),
         kv_cache_weight=float(routing.get("kv_cache_weight", 2.0)),
@@ -113,24 +145,39 @@ def load_config(config_path: str) -> RouterConfig:
         hardware_profile=data.get("hardware_profile", {}),
     )
 
-def get_tokenizer_node(states: dict[str, NodeRoutingState], tokenizer_node_id: str) -> NodeRoutingState:
-    node = states.get(tokenizer_node_id)
-    if node is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Tokenizer node is unavailable: {tokenizer_node_id}",
+
+def build_policy(config: RouterConfig) -> KareserveBasePolicy:
+    cost_model = CostModel.from_hardware_profile(
+        config.hardware_profile,
+        tokens_per_work_unit=config.prefix_tokens_per_load_unit,
+        decode_token_weight=config.decode_token_weight,
+    )
+    policy_name = config.policy.lower()
+    if policy_name in {"windowed_prefix", "medium_aware"}:
+        return WindowedPrefixAffinityPolicy(
+            cost_model=cost_model,
+            queue_weight=config.queue_weight,
+            group_block_size=config.group_block_size,
+            kv_cache_weight=config.kv_cache_weight,
+            kv_cache_high_watermark=config.kv_cache_high_watermark,
+            kv_cache_hard_limit=config.kv_cache_hard_limit,
         )
-    return node
+    if policy_name == "round_robin":
+        return RoundRobinPolicy(cost_model)
+    if policy_name == "prefix_hash":
+        return PrefixHashPolicy(config.prefix_hash_tokens, cost_model)
+    if policy_name == "least_load":
+        return LeastLoadPolicy(cost_model)
+    raise ValueError(f"Unsupported routing policy: {policy_name}")
+
 
 async def poll_metrics(app_state: Any) -> None:
-    tracker = app_state.tracker
+    tracker: KareserveTracker = app_state.tracker
     interval = app_state.config.metrics_interval_seconds
     timeout = aiohttp.ClientTimeout(total=2.0)
-
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
-            states = tracker.get_routing_states([])
-            for node in states.values():
+            for node in tracker.get_routing_states().values():
                 try:
                     async with session.get(f"{node.endpoint_url}/metrics") as response:
                         if response.status == 200:
@@ -141,20 +188,31 @@ async def poll_metrics(app_state: Any) -> None:
                             tracker.mark_metrics_unavailable(node.node_id)
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     tracker.mark_metrics_unavailable(node.node_id)
-                    logger.debug("Metrics unavailable for %s", node.node_id)
             await asyncio.sleep(interval)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config_path = os.environ.get("KARESERVE_CONFIG", "configs/router.single-node.json")
     config = load_config(config_path)
-
+    tokenizer = LocalRequestTokenizer(
+        config.tokenizer_path,
+        revision=config.tokenizer_revision,
+        trust_remote_code=config.tokenizer_trust_remote_code,
+        chat_template_path=config.chat_template_path,
+        allow_request_chat_template=config.allow_request_chat_template,
+    )
     initial_nodes = [
-        NodeState(node_id=node["node_id"], host=node["host"], port=node["port"])
+        NodeState(
+            node_id=node["node_id"],
+            host=node["host"],
+            port=int(node["port"]),
+            cache_domain_id=node.get("cache_domain_id", node["node_id"]),
+        )
         for node in config.nodes
     ]
-    policy = build_policy(config)
     tracker = KareserveTracker(initial_nodes)
+    policy = build_policy(config)
     request_pool = RequestPool(
         tracker=tracker,
         policy=policy,
@@ -164,65 +222,33 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.config = config
+    app.state.tokenizer = tokenizer
     app.state.tracker = tracker
     app.state.request_pool = request_pool
     app.state.policy = policy
-
-    for node_config in config.nodes:
-        endpoint = node_config.get("kv_events_endpoint")
+    for node in config.nodes:
+        endpoint = node.get("kv_events_endpoint")
         if endpoint:
-            tracker.start_zmq_listener(node_config["node_id"], endpoint)
-
+            tracker.start_zmq_listener(
+                node["node_id"],
+                endpoint,
+                node.get("kv_replay_endpoint"),
+            )
     request_pool.start()
-    metrics_task = asyncio.create_task(poll_metrics(app.state))
+    metrics_task = asyncio.create_task(
+        poll_metrics(app.state), name="kareserve-metrics"
+    )
+    try:
+        yield
+    finally:
+        metrics_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await metrics_task
+        await request_pool.stop()
+        await tracker.stop()
 
-    yield
-
-    metrics_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await metrics_task
-    await request_pool.stop()
-    tracker.stop()
 
 app = FastAPI(title="Kareserve Cluster Scheduler Gateway", lifespan=lifespan)
-
-def tokenize_payload(body: dict[str, Any]) -> dict[str, Any]:
-    """Build the documented vLLM /tokenize request for chat or completion."""
-    allowed = {
-        "model",
-        "messages",
-        "prompt",
-        "tools",
-        "chat_template",
-        "chat_template_kwargs",
-        "add_generation_prompt",
-        "continue_final_message",
-        "add_special_tokens",
-        "media_io_kwargs",
-        "mm_processor_kwargs",
-    }
-    return {key: value for key, value in body.items() if key in allowed}
-
-async def tokenize_request(node: NodeRoutingState, body: dict[str, Any]) -> list[int]:
-    timeout = aiohttp.ClientTimeout(total=30.0)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            f"{node.endpoint_url}/tokenize", json=tokenize_payload(body)
-        ) as response:
-            response_body = await response.json()
-            if response.status != 200:
-                raise HTTPException(
-                    status_code=502,
-                    detail={"message": "vLLM tokenization failed", "upstream": response_body},
-                )
-            tokens = response_body.get("tokens")
-            if not isinstance(tokens, list) or not all(
-                isinstance(token, int) for token in tokens
-            ):
-                raise HTTPException(
-                    status_code=502, detail="Invalid vLLM /tokenize response"
-                )
-            return tokens
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -237,13 +263,14 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+
 def upstream_request_headers(raw_request: Request) -> dict[str, str]:
     return {
         name: value
         for name, value in raw_request.headers.items()
-        if name.lower() not in HOP_BY_HOP_HEADERS
-        and name.lower() != "content-type"
+        if name.lower() not in HOP_BY_HOP_HEADERS and name.lower() != "content-type"
     }
+
 
 async def open_upstream(
     node: NodeRoutingState,
@@ -251,68 +278,86 @@ async def open_upstream(
     body: dict[str, Any],
     headers: dict[str, str],
 ) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
-    timeout = aiohttp.ClientTimeout(total=3600)
-    upstream_session = aiohttp.ClientSession(timeout=timeout)
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600))
     try:
-        upstream_response = await upstream_session.post(
-            f"{node.endpoint_url}{endpoint}",
-            json=body,
-            headers=headers,
+        response = await session.post(
+            f"{node.endpoint_url}{endpoint}", json=body, headers=headers
         )
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        await upstream_session.close()
+        await session.close()
         raise HTTPException(
             status_code=502,
             detail=f"Upstream request failed for {node.node_id}: {exc}",
         ) from exc
-    return upstream_session, upstream_response
+    return session, response
+
 
 async def stream_upstream(
-    upstream_session: aiohttp.ClientSession,
-    upstream_response: aiohttp.ClientResponse,
-    tracker: KareserveTracker | None = None,
-    node_id: str | None = None,
+    session: aiohttp.ClientSession,
+    response: aiohttp.ClientResponse,
+    tracker: KareserveTracker,
+    node_id: str,
+    inflight_work: float,
+    prompt_tokens: list[int],
+    external_cache_chunk_size: int | None,
 ) -> AsyncGenerator[bytes, None]:
+    completed = False
     try:
-        async for chunk in upstream_response.content.iter_any():
+        async for chunk in response.content.iter_any():
             yield chunk
+        completed = True
     finally:
-        upstream_response.release()
-        await upstream_session.close()
-        if tracker and node_id:
-            tracker.update_active_requests(node_id, -1)
+        response.release()
+        await session.close()
+        if completed and external_cache_chunk_size is not None:
+            tracker.record_external_prefix(
+                node_id, prompt_tokens, external_cache_chunk_size
+            )
+        tracker.release_route(node_id, inflight_work)
+
 
 async def read_upstream(
-    upstream_session: aiohttp.ClientSession,
-    upstream_response: aiohttp.ClientResponse,
-    tracker: KareserveTracker | None = None,
-    node_id: str | None = None,
+    session: aiohttp.ClientSession,
+    response: aiohttp.ClientResponse,
+    tracker: KareserveTracker,
+    node_id: str,
+    inflight_work: float,
+    prompt_tokens: list[int],
+    external_cache_chunk_size: int | None,
 ) -> bytes:
     try:
-        return await upstream_response.read()
+        content = await response.read()
+        if external_cache_chunk_size is not None:
+            tracker.record_external_prefix(
+                node_id, prompt_tokens, external_cache_chunk_size
+            )
+        return content
     finally:
-        upstream_response.release()
-        await upstream_session.close()
-        if tracker and node_id:
-            tracker.update_active_requests(node_id, -1)
+        response.release()
+        await session.close()
+        tracker.release_route(node_id, inflight_work)
+
 
 def route_headers(
     request_id: str,
-    node: NodeRoutingState,
-    route_batch_size: int,
-    queue_wait_ms: float,
-    prefix_hit_blocks: int,
+    assignment: AssignmentResult,
     policy_name: str,
 ) -> dict[str, str]:
+    node = assignment.node
+    match = assignment.prefix_match
+    usage = "unknown" if node.kv_cache_usage is None else f"{node.kv_cache_usage:.6f}"
     return {
         "X-Request-Id": request_id,
         "X-Kareserve-Worker-Id": node.node_id,
         "X-Kareserve-Policy": policy_name,
-        "X-Kareserve-Route-Batch-Size": str(route_batch_size),
-        "X-Kareserve-Queue-Wait-Ms": f"{queue_wait_ms:.3f}",
-        "X-Kareserve-Prefix-Hit-Blocks": str(prefix_hit_blocks),
-        "X-Kareserve-KV-Cache-Usage": f"{node.kv_cache_usage:.6f}",
+        "X-Kareserve-Route-Batch-Size": str(assignment.route_batch_size),
+        "X-Kareserve-Queue-Wait-Ms": f"{assignment.queue_wait_ms:.3f}",
+        "X-Kareserve-GPU-Prefix-Tokens": str(match.gpu_prefix_tokens),
+        "X-Kareserve-CPU-Prefix-Tokens": str(match.cpu_prefix_tokens),
+        "X-Kareserve-Estimated-Cost": f"{assignment.estimated_cost:.6f}",
+        "X-Kareserve-KV-Cache-Usage": usage,
     }
+
 
 async def parse_json_request(raw_request: Request) -> dict[str, Any]:
     try:
@@ -323,27 +368,32 @@ async def parse_json_request(raw_request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="JSON payload must be an object")
     return body
 
+
 async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     body = await parse_json_request(raw_request)
-
     tracker: KareserveTracker = raw_request.app.state.tracker
     config: RouterConfig = raw_request.app.state.config
+    tokenizer: LocalRequestTokenizer = raw_request.app.state.tokenizer
     request_pool: RequestPool = raw_request.app.state.request_pool
+    try:
+        prompt_tokens = tokenizer.encode_request(body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    states = tracker.get_routing_states([])
-    if not states:
-        raise HTTPException(status_code=503, detail="No available vLLM servers")
-    tokenizer_node = get_tokenizer_node(states, config.tokenizer_node_id)
-    prompt_tokens = await tokenize_request(tokenizer_node, body)
     request_id = str(
         body.get("request_id")
         or raw_request.headers.get("x-request-id")
         or f"kareserve-{uuid.uuid4().hex}"
     )
+    configured_output = body.get("max_tokens")
+    if configured_output is None:
+        configured_output = body.get(
+            "max_completion_tokens", config.expected_output_tokens
+        )
     scheduler_request = SchedulerRequest(
         request_id=request_id,
         prompt_tokens=prompt_tokens,
-        max_tokens=int(body.get("max_tokens", 16)),
+        max_tokens=max(0, int(configured_output)),
         raw_body=body,
     )
     try:
@@ -351,16 +401,9 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    selected_node = assignment.node
-    prefix_hit_blocks = assignment.prefix_hit_blocks
-    response_headers = route_headers(
-        request_id=request_id,
-        node=selected_node,
-        route_batch_size=assignment.route_batch_size,
-        queue_wait_ms=assignment.queue_wait_ms,
-        prefix_hit_blocks=prefix_hit_blocks,
-        policy_name=config.policy,
-    )
+    node = assignment.node
+    response_headers = route_headers(request_id, assignment, config.policy)
+    match = assignment.prefix_match
     logger.info(
         "route_decision %s",
         json.dumps(
@@ -369,135 +412,144 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "prefix_id": raw_request.headers.get("x-prefix-id"),
                 "trace_id": raw_request.headers.get("x-trace-id"),
                 "policy": config.policy,
-                "node_id": selected_node.node_id,
+                "node_id": node.node_id,
+                "cache_domain_id": node.cache_domain_id,
                 "route_batch_size": assignment.route_batch_size,
                 "queue_wait_ms": round(assignment.queue_wait_ms, 3),
                 "prompt_tokens": len(prompt_tokens),
-                "prefix_hit_blocks": prefix_hit_blocks,
-                "node_observed_load": selected_node.observed_load,
-                "node_kv_cache_usage": selected_node.kv_cache_usage,
-                "node_metrics_available": selected_node.metrics_available,
+                "gpu_prefix_tokens": match.gpu_prefix_tokens,
+                "cpu_prefix_tokens": match.cpu_prefix_tokens,
+                "missing_tokens": match.missing_tokens,
+                "router_inflight_work": node.router_inflight_work,
+                "estimated_cost": assignment.estimated_cost,
+                "kv_cache_usage": node.kv_cache_usage,
+                "metrics_status": node.metrics_status.value,
+                "catalog_status": node.catalog_status.value,
             },
             separators=(",", ":"),
         ),
     )
 
-    tracker.update_active_requests(selected_node.node_id, 1)
     try:
-        upstream_session, upstream_response = await open_upstream(
-            selected_node,
+        session, response = await open_upstream(
+            node,
             endpoint,
             body,
             upstream_request_headers(raw_request),
         )
     except HTTPException:
-        tracker.update_active_requests(selected_node.node_id, -1)
+        tracker.release_route(node.node_id, assignment.inflight_work)
         raise
 
-    content_type = upstream_response.headers.get("Content-Type")
+    content_type = response.headers.get("Content-Type")
     if content_type:
         response_headers["Content-Type"] = content_type
-
     if body.get("stream", False):
         return StreamingResponse(
             stream_upstream(
-                upstream_session,
-                upstream_response,
+                session,
+                response,
                 tracker,
-                selected_node.node_id,
+                node.node_id,
+                assignment.inflight_work,
+                prompt_tokens,
+                (
+                    config.external_cache_chunk_size
+                    if config.external_cache_enabled and response.status < 400
+                    else None
+                ),
             ),
-            status_code=upstream_response.status,
+            status_code=response.status,
             headers=response_headers,
         )
-
     content = await read_upstream(
-        upstream_session,
-        upstream_response,
+        session,
+        response,
         tracker,
-        selected_node.node_id,
+        node.node_id,
+        assignment.inflight_work,
+        prompt_tokens,
+        (
+            config.external_cache_chunk_size
+            if config.external_cache_enabled and response.status < 400
+            else None
+        ),
     )
-
     return Response(
         content=content,
-        status_code=upstream_response.status,
+        status_code=response.status,
         headers=response_headers,
     )
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(raw_request: Request):
     return await handle_completion(raw_request, "/v1/chat/completions")
 
+
 @app.post("/v1/completions")
 async def completions(raw_request: Request):
     return await handle_completion(raw_request, "/v1/completions")
 
-# @app.post("/tokenize")
-# async def tokenize(raw_request: Request):
-#     body = await parse_json_request(raw_request)
-#     tracker: KareserveTracker = raw_request.app.state.tracker
-#     config: RouterConfig = raw_request.app.state.config
-
-#     states = tracker.get_node_states()
-#     if not states:
-#         raise HTTPException(status_code=503, detail="No available vLLM servers")
-#     node = get_tokenizer_node(states, config.tokenizer_node_id)
-#     upstream_session, upstream_response = await open_upstream(
-#         node,
-#         "/tokenize",
-#         tokenize_payload(body),
-#         upstream_request_headers(raw_request),
-#     )
-#     content = await read_upstream(
-#         upstream_session,
-#         upstream_response,
-#     )
-#     headers: dict[str, str] = {"X-Kareserve-Worker-Id": node.node_id}
-#     content_type = upstream_response.headers.get("Content-Type")
-#     if content_type:
-#         headers["Content-Type"] = content_type
-#     return Response(
-#         content=content,
-#         status_code=upstream_response.status,
-#         headers=headers,
-#     )
 
 @app.get("/health")
 async def health_check(request: Request):
     tracker: KareserveTracker = request.app.state.tracker
     config: RouterConfig = request.app.state.config
     request_pool: RequestPool = request.app.state.request_pool
-
     return {
         "status": "ok",
-        "nodes": [node.node_id for node in tracker.get_routing_states([]).values()],
+        "nodes": list(tracker.get_routing_states()),
         "policy": config.policy,
         "request_pool": request_pool.stats(),
     }
 
-# @app.get("/routing/state")
-# async def routing_state(request: Request):
-#     tracker: KareserveTracker = request.app.state.tracker
-#     config: RouterConfig = request.app.state.config
-#     request_pool: RequestPool = request.app.state.request_pool
 
-#     states = tracker.get_routing_states([])
-#     return {
-#         "policy": config.policy,
-#         "hardware_profile": config.hardware_profile,
-#         "nodes": {
-#             node_id: {
-#                 "endpoint": node.endpoint_url,
-#                 "active_requests": node.active_requests,
-#                 "running_requests": node.running_requests,
-#                 "waiting_requests": node.waiting_requests,
-#                 "kv_cache_usage": node.kv_cache_usage,
-#                 "metrics_available": node.metrics_available,
-#                 "metrics_updated_at": node.metrics_updated_at,
-#                 "external_cache_queries": node.external_cache_queries,
-#                 "external_cache_hits": node.external_cache_hits,
-#                 "external_cache_hit_rate": node.external_cache_hit_rate,
-#             }
-#             for node_id, node in states.items()
-#         },
-#         "request_pool": request_pool.stats(),
-#     }
+@app.get("/routing/state")
+async def routing_state(request: Request):
+    tracker: KareserveTracker = request.app.state.tracker
+    config: RouterConfig = request.app.state.config
+    request_pool: RequestPool = request.app.state.request_pool
+    states = tracker.get_routing_states()
+    return {
+        "policy": config.policy,
+        "nodes": {
+            node_id: {
+                "endpoint": node.endpoint_url,
+                "cache_domain_id": node.cache_domain_id,
+                "router_active_requests": node.router_active_requests,
+                "router_inflight_work": node.router_inflight_work,
+                "running_requests": node.running_requests,
+                "waiting_requests": node.waiting_requests,
+                "kv_cache_usage": node.kv_cache_usage,
+                "gpu_total_blocks": node.gpu_total_blocks,
+                "estimated_gpu_free_blocks": node.estimated_gpu_free_blocks,
+                "gpu_block_size": node.gpu_block_size,
+                "metrics_status": node.metrics_status.value,
+                "metrics_updated_at": node.metrics_updated_at,
+                "process_start_time_seconds": node.process_start_time_seconds,
+                "catalog_status": node.catalog_status.value,
+            }
+            for node_id, node in states.items()
+        },
+        "cache_catalog": {
+            "blocks": len(tracker.cached_blocks),
+            "placements": sum(
+                len(block.placements) for block in tracker.cached_blocks.values()
+            ),
+            "external_source": (
+                "completed_request_admission"
+                if config.external_cache_enabled
+                else "disabled"
+            ),
+            "external_chunk_size": config.external_cache_chunk_size,
+        },
+        "monitoring": {
+            node_id: {
+                "external_cache_queries": tracker.nodes[node_id].external_cache_queries,
+                "external_cache_hits": tracker.nodes[node_id].external_cache_hits,
+            }
+            for node_id in states
+        },
+        "request_pool": request_pool.stats(),
+    }

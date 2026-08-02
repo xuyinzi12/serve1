@@ -18,11 +18,11 @@ Router JSON提供节点与策略完整配置
 
 ## Router JSON
 
-`nodes`定义每个vLLM实例。`port`是OpenAI HTTP API端口；`kv_events_endpoint`是该实例发布GPU KVCache元数据事件的ZMQ端口。GPU0调试实例使用HTTP 8101和KV Event 5557，两个端口属于同一个vLLM进程。
+`nodes`定义每个vLLM实例。`port`是OpenAI HTTP API端口；`kv_events_endpoint`发布GPU KVCache元数据事件；`kv_replay_endpoint`补发Router断连期间仍保留的事件；`cache_domain_id`标识实例连接的外部缓存实体。共享同一个LMCache MP Server的实例使用相同`cache_domain_id`。
 
-`tokenizer_node_id`显式指定Router调用`/tokenize`的实例。所有实例加载同一个模型和Tokenizer时会生成相同Token ID。固定节点保证Token化来源明确。该节点的CPU Tokenizer吞吐需要单独监控。
+`tokenizer`定义Router本地Chat Template。Router从`KARESERVE_TOKENIZER_PATH`或`KARESERVE_MODEL`加载Tokenizer，并在进程内生成Token IDs。Router与所有vLLM实例使用相同模型版本和Chat Template。
 
-`routing`定义窗口、窗口容量、策略权重和KVCache容量阈值。`hardware_profile`记录硬件实测结果。当前`windowed_prefix`策略没有使用H2D带宽参数。
+`routing`定义窗口、窗口容量、预期输出长度、外部缓存Chunk大小、策略权重和KVCache容量阈值。`hardware_profile`记录硬件实测结果，并向介质感知成本模型提供H2D带宽与模型计算参数。
 
 ## 实验Manifest
 
@@ -68,6 +68,7 @@ Router JSON提供节点与策略完整配置
 | `GPU_IDS` | 启动的GPU编号 | `1` |
 | `KARESERVE_CONFIG_PATH` | Router JSON | `configs/router.single-node.json` |
 | `KARESERVE_MODEL` | vLLM模型路径 | `/home/zn/llm_models/opt-1.3b` |
+| `KARESERVE_TOKENIZER_PATH` | Router本地Tokenizer路径；空值复用模型路径 | 空 |
 | `KARESERVE_MODEL_NAME` | OpenAI API模型名 | `kareserve-opt-1.3b` |
 | `KARESERVE_DTYPE` | 模型数据类型 | `half` |
 | `KARESERVE_GPU_MEMORY_UTILIZATION` | vLLM显存使用比例 | `0.5` |
@@ -84,7 +85,7 @@ Router JSON提供节点与策略完整配置
 | `KARESERVE_TEMPERATURE` | 采样温度 | `0` |
 | `KARESERVE_IGNORE_EOS` | 固定输出长度 | `1` |
 
-启动脚本会校验GPU编号与Router端口映射。缺失Router JSON、重复节点ID、错误Tokenizer节点和GPU端口不一致都会使启动失败。
+启动脚本会校验GPU编号与Router的HTTP、KV Event、Replay端口映射。缺失Router JSON、重复节点ID、缺失缓存域和GPU端口不一致都会使启动失败。
 
 ## 配置优先级
 
