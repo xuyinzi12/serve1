@@ -1,31 +1,23 @@
 {
   "nodes": [
     {
-      "node_id": "prefill-node-gpu0",
-      "host": "127.0.0.1",
-      "port": 8101,
-      "cache_domain_id": "lmcache-local",
-      "kv_events_endpoint": "tcp://127.0.0.1:5557",
-      "kv_replay_endpoint": "tcp://127.0.0.1:6557"
-    },
-    {
-      "node_id": "prefill-node-gpu1",
+      "node_id": "gpu1",
       "host": "127.0.0.1",
       "port": 8102,
-      "cache_domain_id": "lmcache-local",
+      "cache_domain_id": "local-memory",
       "kv_events_endpoint": "tcp://127.0.0.1:5558",
       "kv_replay_endpoint": "tcp://127.0.0.1:6558"
     }
   ],
   "cache_domains": {
-    "lmcache-local": {
+    "local-memory": {
       "http_url": "http://127.0.0.1:8080",
       "world_size": 1,
       "model_name": "kareserve-opt-1.3b"
     }
   },
   "tokenizer": {
-    "chat_template_path": "chat_templates/opt.jinja"
+    "path": "/home/zn/llm_models/opt-1.3b"
   },
   "routing": {
     "policy": "windowed_prefix",
@@ -44,8 +36,9 @@
     "prefix_hash_tokens": 256
   },
   "hardware_profile": {
-    "h2d_bandwidth_gbps": 0.0,
-    "h2d_base_latency_ms": 0.0,
+    "host_memory_to_gpu_bandwidth_gbps": 22.4,
+    "host_memory_to_gpu_latency_ms": 0.046,
+    "prefill_ms_per_token": null,
     "num_layers": 24,
     "hidden_size": 2048,
     "kv_dtype_bytes": 2,
@@ -54,13 +47,6 @@
         "bandwidth_gbps": 0.5537376778,
         "base_latency_ms": 0.0
       }
-    },
-    "measurement_scope": "measure_each_configured_gpu",
-    "measurement": "scripts/benchmark/measure_h2d_bandwidth.py",
-    "storage_measurement_date": "2026-08-02",
-    "storage_measurement_path": "/home/zn/xyz/serve1/runtime/lmcache/l2",
-    "storage_measurement_size_mb": 1024,
-    "storage_write_bandwidth_gbps": 0.2255583984,
-    "storage_measurement": "scripts/benchmark/measure_storage_bandwidth.py"
+    }
   }
 }

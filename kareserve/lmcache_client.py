@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Authoritative LMCache L1/L2 prefix lookup client."""
+"""Client for authoritative LMCache L1/L2 prefix lookup."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 
 import aiohttp
 
-from kareserve.kareserve_state import PrefixMatch, SchedulerRequest
+from kareserve.state import PrefixMatch, SchedulerRequest
 
 
 @dataclass(frozen=True, slots=True)

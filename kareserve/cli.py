@@ -22,7 +22,7 @@ def main() -> None:
     import uvicorn
 
     uvicorn.run(
-        "kareserve.kareserve_server:app",
+        "kareserve.server:app",
         host=args.host,
         port=args.port,
         log_level=args.log_level,

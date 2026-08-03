@@ -18,7 +18,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
-from kareserve.kareserve_policy import (
+from kareserve.policy import (
     CostModel,
     KareserveBasePolicy,
     LeastLoadPolicy,
@@ -26,10 +26,10 @@ from kareserve.kareserve_policy import (
     RoundRobinPolicy,
     WindowedPrefixAffinityPolicy,
 )
-from kareserve.lmcache_lookup import CacheDomainConfig, LMCacheLookupClient
-from kareserve.kareserve_state import NodeRoutingState, NodeState, SchedulerRequest
-from kareserve.kareserve_tokenizer import LocalRequestTokenizer
-from kareserve.kareserve_tracker import KareserveTracker
+from kareserve.lmcache_client import CacheDomainConfig, LMCacheLookupClient
+from kareserve.state import NodeRoutingState, NodeState, SchedulerRequest
+from kareserve.tokenizer import LocalRequestTokenizer
+from kareserve.tracker import KareserveTracker
 from kareserve.request_pool import AssignmentResult, RequestPool
 
 logger = logging.getLogger("kareserve.server")
@@ -217,7 +217,7 @@ async def poll_metrics(app_state: Any) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    config_path = os.environ.get("KARESERVE_CONFIG", "configs/router.single-node.json")
+    config_path = os.environ.get("KARESERVE_CONFIG", "configs/config.json")
     config = load_config(config_path)
     tokenizer = LocalRequestTokenizer(
         config.tokenizer_path,

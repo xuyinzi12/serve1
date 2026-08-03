@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from kareserve.kareserve_state import (
+from kareserve.state import (
     CacheMedium,
     MetricsStatus,
     RouteAssignment,
@@ -41,24 +41,30 @@ class CostModel:
         tokens_per_work_unit: float,
         decode_token_weight: float,
     ) -> CostModel:
-        gpu_flops = float(profile.get("gpu_flops_tflops", 0.0)) * 1e12
-        model_params = float(profile.get("model_params_billions", 0.0)) * 1e9
         layers = int(profile.get("num_layers", 0))
         hidden_size = int(profile.get("hidden_size", 0))
         dtype_bytes = float(profile.get("kv_dtype_bytes", 2.0))
-        compute_ms = None
+        configured_prefill_ms = profile.get("prefill_ms_per_token")
+        compute_ms = (
+            float(configured_prefill_ms)
+            if configured_prefill_ms is not None
+            and float(configured_prefill_ms) > 0
+            else None
+        )
         kv_bytes = None
-        if gpu_flops > 0 and model_params > 0:
-            compute_ms = 2.0 * model_params / gpu_flops * 1000.0
         if layers > 0 and hidden_size > 0:
             kv_bytes = 2.0 * layers * hidden_size * dtype_bytes
 
         medium_profiles = dict(profile.get("medium_profiles", {}))
-        h2d_bandwidth = float(profile.get("h2d_bandwidth_gbps", 0.0))
-        if h2d_bandwidth > 0 and "CPU" not in medium_profiles:
+        memory_to_gpu_bandwidth = float(
+            profile.get("host_memory_to_gpu_bandwidth_gbps", 0.0)
+        )
+        if memory_to_gpu_bandwidth > 0 and "CPU" not in medium_profiles:
             medium_profiles["CPU"] = {
-                "bandwidth_gbps": h2d_bandwidth,
-                "base_latency_ms": float(profile.get("h2d_base_latency_ms", 0.0)),
+                "bandwidth_gbps": memory_to_gpu_bandwidth,
+                "base_latency_ms": float(
+                    profile.get("host_memory_to_gpu_latency_ms", 0.0)
+                ),
             }
 
         return cls(
@@ -80,7 +86,11 @@ class CostModel:
     def transfer_cost(self, medium: CacheMedium, tokens: int) -> float:
         tokens = max(0, tokens)
         profile = (self.medium_profiles or {}).get(medium.value)
-        if profile and self.kv_bytes_per_token is not None:
+        if (
+            profile
+            and self.kv_bytes_per_token is not None
+            and self.compute_ms_per_token is not None
+        ):
             bandwidth = float(profile.get("bandwidth_gbps", 0.0))
             if bandwidth > 0:
                 transfer_ms = (

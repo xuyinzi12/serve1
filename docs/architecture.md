@@ -28,9 +28,9 @@ request cost
 + GPU KVCache capacity pressure
 ```
 
-硬件Profile把KVCache字节数、介质带宽和固定延迟换算为毫秒。Profile缺少必要字段时，Policy使用归一化工作单位。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。
+硬件 Profile 使用 KVCache 字节数、介质带宽和固定延迟计算传输时间。`host_memory_to_gpu_bandwidth_gbps`描述主机运行内存到GPU显存的有效带宽；`prefill_ms_per_token`描述当前模型的实测Prefill时间。Profile缺少完整实测值时，Policy使用归一化工作单位。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。
 
-`windowed_prefix`先按公共Token Prefix形成逻辑组，再选择组内总代价最低的共同节点。`round_robin`、`least_load`和`prefix_hash`保留为实验基线。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
+`windowed_prefix`先按公共Token Prefix形成逻辑组，再选择组内总代价最低的共同节点。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
 
 ## 一致性边界
 

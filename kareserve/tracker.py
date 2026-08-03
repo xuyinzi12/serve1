@@ -16,7 +16,7 @@ import msgspec
 import zmq
 import zmq.asyncio
 
-from kareserve.kareserve_state import (
+from kareserve.state import (
     CatalogStatus,
     MetricsStatus,
     NodeRoutingState,

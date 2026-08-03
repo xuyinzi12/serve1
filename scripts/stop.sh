@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT=${KARESERVE_ROOT:-/home/zn/xyz/serve1}
-RUNTIME="$ROOT/runtime"
+PID_DIR="$ROOT/runtime/pids"
 
-for pid_file in "$RUNTIME"/pids/*.pid; do
+[[ -d "$PID_DIR" ]] || exit 0
+for pid_file in "$PID_DIR"/*.pid; do
   [[ -e "$pid_file" ]] || continue
   pid="$(cat "$pid_file")"
   command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"

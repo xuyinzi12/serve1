@@ -100,7 +100,7 @@ def main() -> None:
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "memory_total_bytes": properties.total_memory,
-        "transfer": "pinned_host_to_device",
+        "transfer": "host_memory_to_gpu",
         "warmup": args.warmup,
         "iterations": args.iterations,
         "samples": results,

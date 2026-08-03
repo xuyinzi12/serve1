@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LMCache MP server entry point with authoritative cache lookup APIs."""
+"""LMCache MP server with authoritative cache lookup APIs."""
 
 from __future__ import annotations
 
