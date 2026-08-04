@@ -56,6 +56,7 @@ class RequestPool:
         self.group_block_size = max(1, group_block_size)
         self.lmcache_lookup = lmcache_lookup
         self.queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
+        self._deferred: PendingRequest | None = None
         self._task: asyncio.Task[None] | None = None
         self.total_batches = 0
         self.total_requests = 0
@@ -99,23 +100,38 @@ class RequestPool:
 
     async def _run(self) -> None:
         while True:
-            first = await self.queue.get()
-            batch = [first]
-            deadline = asyncio.get_running_loop().time() + self.window_seconds
-            while len(batch) < self.max_batch_size:
-                timeout = deadline - asyncio.get_running_loop().time()
-                if timeout <= 0:
-                    break
-                try:
-                    batch.append(await asyncio.wait_for(self.queue.get(), timeout))
-                except asyncio.TimeoutError:
-                    break
+            first = self._deferred
+            self._deferred = None
+            if first is None:
+                first = await self.queue.get()
+            batch = await self._collect_batch(first)
             try:
                 await self._flush(batch)
             except Exception as exc:  # noqa: BLE001
                 for item in batch:
                     if not item.future.done():
                         item.future.set_exception(exc)
+
+    async def _collect_batch(self, first: PendingRequest) -> list[PendingRequest]:
+        batch = [first]
+        deadline = first.queued_at + self.window_seconds
+        loop = asyncio.get_running_loop()
+        while len(batch) < self.max_batch_size:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(self.queue.get(), timeout)
+                except asyncio.TimeoutError:
+                    break
+            if item.queued_at > deadline:
+                self._deferred = item
+                break
+            batch.append(item)
+        return batch
 
     async def _flush(self, batch: list[PendingRequest]) -> None:
         flushed_at = asyncio.get_running_loop().time()

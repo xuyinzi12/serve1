@@ -39,6 +39,8 @@ Router使用同一个`request_id`关联选点快照与执行结果。选点快�
 
 选点快照将Router前置路径拆分为本地分词、聚合等待、LMCache查询、候选状态构造和Policy计算。批量阶段耗时表示整个路由窗口的工作量，同一窗口内的请求共享该值；`pool_total_ms`表示单个请求从进入Request Pool到获得分配结果的完整时间。
 
+聚合窗口从首个请求进入Request Pool的时刻开始。Request Pool按照各请求的入池时间划定批次，工作协程自身的事件循环调度延迟不会延长窗口边界。
+
 ## 一致性边界
 
 GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节点的GPU目录状态标记为`degraded`。LMCache查询失败时，对应缓存域标记为`degraded`，当前窗口按外部缓存Miss处理。Router状态接口分别输出GPU目录状态和LMCache目录状态。
