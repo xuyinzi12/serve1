@@ -114,6 +114,8 @@ class RequestPool:
 
     async def _collect_batch(self, first: PendingRequest) -> list[PendingRequest]:
         batch = [first]
+        if self.window_seconds <= 0:
+            return batch
         deadline = first.queued_at + self.window_seconds
         loop = asyncio.get_running_loop()
         while len(batch) < self.max_batch_size:
