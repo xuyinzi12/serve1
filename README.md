@@ -59,6 +59,15 @@ curl http://127.0.0.1:8090/routing/state
 bash scripts/run_benchmark.sh
 ```
 
+服务器现有ShareGPT JSONL通过只读转换后交给vLLM Benchmark：
+
+```bash
+.venv-vllm-0.26/bin/python scripts/convert_sharegpt.py --input /home/zn/datasets/sharegpt/shareGPT/computer_zh_26k.jsonl --output runtime/datasets/sharegpt-zh.json
+.venv-vllm-0.26/bin/python scripts/analyze_prefix_reuse.py --dataset runtime/datasets/sharegpt-zh.json --tokenizer /home/zn/llm_models/opt-1.3b --num-requests 256 --seed 0
+```
+
+转换结果位于`runtime/`，源数据保持不变。vLLM使用第一段用户文本构造Prompt，使用第二段模型回答确定期望输出长度。
+
 Prefill模型使用空闲vLLM实例离线标定：
 
 ```bash
@@ -84,6 +93,8 @@ Router 透传`POST /v1/completions`和`POST /v1/chat/completions`，并提供`PO
 Router 负责请求聚合、Prefix 分组、缓存状态查询、实例选择和 HTTP 转发。vLLM 负责实际执行批次。LMCache Connector 负责主机内存或磁盘中的 KVCache 加载。
 
 `KARESERVE_ENABLE_LMCACHE`控制LMCache服务和vLLM Connector，`KARESERVE_ENABLE_LMCACHE_LOOKUP`控制Router请求前目录查询。查询开关未设置时跟随数据面开关；低外部Prefix复用场景可以保留Connector并关闭Router查询。
+
+默认启动关闭LMCache数据面，Router继续使用vLLM GPU Prefix Cache事件。外部缓存实验通过`KARESERVE_ENABLE_LMCACHE=1`显式开启LMCache服务和Connector。
 
 `runtime/`只保存当前机器生成的日志、PID、LMCache数据和Benchmark结果。该目录由脚本按需创建，不进入Git仓库。
 

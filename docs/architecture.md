@@ -16,6 +16,8 @@ LMCache状态来自项目扩展的只读查询接口。查询接口使用LMCache
 
 LMCache数据面和Router目录查询使用独立开关。数据面保持开启时，vLLM Connector继续执行外部缓存存取；Router查询关闭时，Policy只使用GPU目录和节点负载，外部缓存命中由Connector在执行阶段自行完成。
 
+默认部署关闭LMCache数据面。普通ShareGPT样本缺少块对齐外部Prefix复用时，Connector Miss路径会增加请求时延；具备稳定共享Prefix的工作负载通过部署参数显式启用外部缓存。
+
 实例负载来自vLLM`/metrics`和Router本地在途记录。路由输入包含vLLM运行队列、等待队列、GPU KVCache使用率、Router已分配工作量和请求所需新增Block数。缺失指标保持未知状态，Policy不会把未知值解释为零负载或满负载。
 
 ## 路由代价
