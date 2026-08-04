@@ -120,6 +120,23 @@ class RouteCandidate:
     required_new_gpu_blocks: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class RouteCostBreakdown:
+    prefill_cost: float
+    router_load_cost: float
+    engine_queue_cost: float
+    capacity_cost: float
+
+    @property
+    def total(self) -> float:
+        return (
+            self.prefill_cost
+            + self.router_load_cost
+            + self.engine_queue_cost
+            + self.capacity_cost
+        )
+
+
 @dataclass(slots=True)
 class SchedulerRequest:
     request_id: str
@@ -133,3 +150,4 @@ class RouteAssignment:
     candidate: RouteCandidate
     inflight_work: float
     estimated_cost: float
+    cost_breakdown: RouteCostBreakdown | None = None

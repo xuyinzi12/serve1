@@ -13,6 +13,7 @@ from kareserve.lmcache_client import LMCacheLookupClient
 from kareserve.state import (
     NodeRoutingState,
     PrefixMatch,
+    RouteCostBreakdown,
     SchedulerRequest,
 )
 from kareserve.tracker import KareserveTracker
@@ -37,6 +38,7 @@ class AssignmentResult:
     cache_lookup_ms: float
     candidate_build_ms: float
     policy_ms: float
+    cost_breakdown: RouteCostBreakdown | None
 
 
 class RequestPool:
@@ -185,5 +187,6 @@ class RequestPool:
                     * 1000.0,
                     policy_ms=(policy_completed_at - candidates_completed_at)
                     * 1000.0,
+                    cost_breakdown=assignment.cost_breakdown,
                 )
             )

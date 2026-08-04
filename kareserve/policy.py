@@ -16,6 +16,7 @@ from kareserve.state import (
     PrefixMatch,
     RouteAssignment,
     RouteCandidate,
+    RouteCostBreakdown,
     SchedulerRequest,
 )
 
@@ -200,12 +201,14 @@ class KareserveBasePolicy(ABC):
         request: SchedulerRequest,
         candidate: RouteCandidate,
         estimated_cost: float,
+        cost_breakdown: RouteCostBreakdown | None = None,
     ) -> RouteAssignment:
         work = self.cost_model.candidate_work(request, candidate)
         return RouteAssignment(
             candidate=candidate,
             inflight_work=work,
             estimated_cost=estimated_cost,
+            cost_breakdown=cost_breakdown,
         )
 
 
@@ -266,24 +269,28 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
             )
         return pressure
 
-    def _base_load(self, candidate: RouteCandidate, virtual_work: float) -> float:
+    def _cost_breakdown(
+        self,
+        candidate: RouteCandidate,
+        virtual_work: float,
+        free_blocks: int | None,
+    ) -> RouteCostBreakdown:
         request_pressure = 0.25 * candidate.node.router_active_requests
-        return virtual_work + self.queue_weight * (
-            candidate.node.queue_depth + request_pressure
+        return RouteCostBreakdown(
+            prefill_cost=self.cost_model.candidate_prefill_cost(candidate),
+            router_load_cost=virtual_work,
+            engine_queue_cost=self.queue_weight
+            * (candidate.node.queue_depth + request_pressure),
+            capacity_cost=self._capacity_pressure(candidate, free_blocks),
         )
 
     def _candidate_cost(
         self,
-        request: SchedulerRequest,
         candidate: RouteCandidate,
         virtual_work: float,
         free_blocks: int | None,
     ) -> float:
-        return (
-            self._base_load(candidate, virtual_work)
-            + self.cost_model.candidate_prefill_cost(candidate)
-            + self._capacity_pressure(candidate, free_blocks)
-        )
+        return self._cost_breakdown(candidate, virtual_work, free_blocks).total
 
     def _shared_prefix_groups(
         self, requests: list[SchedulerRequest]
@@ -393,7 +400,6 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
                 eligible,
                 key=lambda item: (
                     self._candidate_cost(
-                        request,
                         item,
                         work[item.node.node_id],
                         free.get(item.node.node_id),
@@ -402,13 +408,13 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
                 ),
             )
             node_id = candidate.node.node_id
-            cost = self._candidate_cost(
-                request,
-                candidate,
-                work[node_id],
-                free.get(node_id),
+            breakdown = self._cost_breakdown(
+                candidate, work[node_id], free.get(node_id)
             )
-            assignment = self._assignment(request, candidate, cost)
+            cost = breakdown.total
+            assignment = self._assignment(
+                request, candidate, cost, cost_breakdown=breakdown
+            )
             assignments[request.request_id] = assignment
             score += cost
             work[node_id] += assignment.inflight_work

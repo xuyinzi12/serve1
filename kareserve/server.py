@@ -537,6 +537,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         request_id, assignment, config.policy, estimated_cost_unit
     )
     match = assignment.prefix_match
+    cost_breakdown = assignment.cost_breakdown
     logger.info(
         "route_decision %s",
         json.dumps(
@@ -566,6 +567,18 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "router_inflight_work": node.router_inflight_work,
                 "estimated_cost": assignment.estimated_cost,
                 "estimated_cost_unit": estimated_cost_unit,
+                "estimated_prefill_cost": (
+                    cost_breakdown.prefill_cost if cost_breakdown else None
+                ),
+                "estimated_router_load_cost": (
+                    cost_breakdown.router_load_cost if cost_breakdown else None
+                ),
+                "estimated_engine_queue_cost": (
+                    cost_breakdown.engine_queue_cost if cost_breakdown else None
+                ),
+                "estimated_capacity_cost": (
+                    cost_breakdown.capacity_cost if cost_breakdown else None
+                ),
                 "kv_cache_usage": node.kv_cache_usage,
                 "metrics_status": node.metrics_status.value,
                 "gpu_catalog_status": node.gpu_catalog_status.value,
