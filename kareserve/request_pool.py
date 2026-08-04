@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,10 @@ class AssignmentResult:
     queue_wait_ms: float
     inflight_work: float
     estimated_cost: float
+    pool_total_ms: float
+    cache_lookup_ms: float
+    candidate_build_ms: float
+    policy_ms: float
 
 
 class RequestPool:
@@ -116,13 +121,17 @@ class RequestPool:
         flushed_at = asyncio.get_running_loop().time()
         requests = [item.request for item in batch]
         external_matches = None
+        stage_started_at = time.perf_counter()
         if self.lmcache_lookup is not None:
             external_matches, failed_domains = await self.lmcache_lookup.lookup(requests)
             self.tracker.set_lmcache_lookup_status(failed_domains)
+        lookup_completed_at = time.perf_counter()
         candidates = self.tracker.build_route_candidates(
             requests, self.group_block_size, external_matches
         )
+        candidates_completed_at = time.perf_counter()
         assignments = self.policy.select_batch(requests, candidates)
+        policy_completed_at = time.perf_counter()
         self.total_batches += 1
         self.total_requests += len(batch)
         self.last_batch_size = len(batch)
@@ -144,5 +153,19 @@ class RequestPool:
                     queue_wait_ms=max(0.0, (flushed_at - item.queued_at) * 1000.0),
                     inflight_work=assignment.inflight_work,
                     estimated_cost=assignment.estimated_cost,
+                    pool_total_ms=max(
+                        0.0,
+                        (
+                            asyncio.get_running_loop().time() - item.queued_at
+                        )
+                        * 1000.0,
+                    ),
+                    cache_lookup_ms=(lookup_completed_at - stage_started_at) * 1000.0,
+                    candidate_build_ms=(
+                        candidates_completed_at - lookup_completed_at
+                    )
+                    * 1000.0,
+                    policy_ms=(policy_completed_at - candidates_completed_at)
+                    * 1000.0,
                 )
             )

@@ -497,6 +497,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         prompt_tokens = tokenizer.encode_request(body)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    tokenization_completed_at = time.perf_counter()
 
     request_id = str(
         body.get("request_id")
@@ -542,6 +543,14 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "cache_domain_id": node.cache_domain_id,
                 "route_batch_size": assignment.route_batch_size,
                 "queue_wait_ms": round(assignment.queue_wait_ms, 3),
+                "tokenization_ms": round(
+                    (tokenization_completed_at - request_started_at) * 1000.0,
+                    3,
+                ),
+                "pool_total_ms": round(assignment.pool_total_ms, 3),
+                "cache_lookup_ms": round(assignment.cache_lookup_ms, 3),
+                "candidate_build_ms": round(assignment.candidate_build_ms, 3),
+                "policy_ms": round(assignment.policy_ms, 3),
                 "prompt_tokens": len(prompt_tokens),
                 "gpu_prefix_tokens": match.gpu_prefix_tokens,
                 "cpu_prefix_tokens": match.cpu_prefix_tokens,
