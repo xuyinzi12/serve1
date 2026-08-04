@@ -84,3 +84,5 @@ Router 透传`POST /v1/completions`和`POST /v1/chat/completions`，并提供`PO
 Router 负责请求聚合、Prefix 分组、缓存状态查询、实例选择和 HTTP 转发。vLLM 负责实际执行批次。LMCache Connector 负责主机内存或磁盘中的 KVCache 加载。
 
 `runtime/`只保存当前机器生成的日志、PID、LMCache数据和Benchmark结果。该目录由脚本按需创建，不进入Git仓库。
+
+Router为每个请求记录`route_decision`和`route_result`两类结构化日志。前者保存选点时的Prefix命中、聚合等待和预测成本；后者保存上游连接、首个有效输出事件、完整响应耗时和响应字节数。两类记录通过`request_id`关联。`estimated_cost_unit=ms`表示当前配置已加载Prefill时间模型，`normalized`表示策略仍在使用归一化工作量。

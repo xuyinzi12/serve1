@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -27,6 +28,7 @@ from kareserve.policy import (
     WindowedPrefixAffinityPolicy,
 )
 from kareserve.lmcache_client import CacheDomainConfig, LMCacheLookupClient
+from kareserve.observability import RequestObservation, SSEOutputDetector
 from kareserve.state import NodeRoutingState, NodeState, SchedulerRequest
 from kareserve.tokenizer import LocalRequestTokenizer
 from kareserve.tracker import KareserveTracker
@@ -63,6 +65,21 @@ class RouterConfig:
     inflight_prefix_reuse_probability: float = 0.0
     prefix_hash_tokens: int = 256
     hardware_profile: dict[str, Any] = field(default_factory=dict)
+
+
+def _log_route_result(
+    observation: RequestObservation,
+    *,
+    outcome: str,
+    error: str | None = None,
+) -> None:
+    logger.info(
+        "route_result %s",
+        json.dumps(
+            observation.result(outcome, error),
+            separators=(",", ":"),
+        ),
+    )
 
 
 def _resolve_optional_path(value: str | None, config_path: Path) -> str | None:
@@ -342,14 +359,29 @@ async def stream_upstream(
     tracker: KareserveTracker,
     node_id: str,
     inflight_work: float,
+    observation: RequestObservation,
 ) -> AsyncGenerator[bytes, None]:
+    output_detector = SSEOutputDetector()
+    outcome = "completed"
+    error = None
     try:
         async for chunk in response.content.iter_any():
+            observation.response_bytes += len(chunk)
+            if observation.first_output_at is None and output_detector.feed(chunk):
+                observation.first_output_at = time.perf_counter()
             yield chunk
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception as exc:
+        outcome = "error"
+        error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         response.release()
         await session.close()
         tracker.release_route(node_id, inflight_work)
+        _log_route_result(observation, outcome=outcome, error=error)
 
 
 async def read_upstream(
@@ -358,19 +390,33 @@ async def read_upstream(
     tracker: KareserveTracker,
     node_id: str,
     inflight_work: float,
+    observation: RequestObservation,
 ) -> bytes:
+    outcome = "completed"
+    error = None
     try:
-        return await response.read()
+        content = await response.read()
+        observation.response_bytes = len(content)
+        return content
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception as exc:
+        outcome = "error"
+        error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         response.release()
         await session.close()
         tracker.release_route(node_id, inflight_work)
+        _log_route_result(observation, outcome=outcome, error=error)
 
 
 def route_headers(
     request_id: str,
     assignment: AssignmentResult,
     policy_name: str,
+    estimated_cost_unit: str,
 ) -> dict[str, str]:
     node = assignment.node
     match = assignment.prefix_match
@@ -386,6 +432,7 @@ def route_headers(
         "X-Kareserve-FS-Prefix-Tokens": str(match.fs_prefix_tokens),
         "X-Kareserve-OBJ-Prefix-Tokens": str(match.obj_prefix_tokens),
         "X-Kareserve-Estimated-Cost": f"{assignment.estimated_cost:.6f}",
+        "X-Kareserve-Estimated-Cost-Unit": estimated_cost_unit,
         "X-Kareserve-KV-Cache-Usage": usage,
     }
 
@@ -440,6 +487,7 @@ async def detokenize(raw_request: Request) -> Response:
 
 
 async def handle_completion(raw_request: Request, endpoint: str) -> Response:
+    request_started_at = time.perf_counter()
     body = await parse_json_request(raw_request)
     tracker: KareserveTracker = raw_request.app.state.tracker
     config: RouterConfig = raw_request.app.state.config
@@ -472,7 +520,15 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     node = assignment.node
-    response_headers = route_headers(request_id, assignment, config.policy)
+    assignment_completed_at = time.perf_counter()
+    estimated_cost_unit = (
+        "ms"
+        if raw_request.app.state.policy.cost_model.prefill_model is not None
+        else "normalized"
+    )
+    response_headers = route_headers(
+        request_id, assignment, config.policy, estimated_cost_unit
+    )
     match = assignment.prefix_match
     logger.info(
         "route_decision %s",
@@ -494,6 +550,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "missing_tokens": match.missing_tokens,
                 "router_inflight_work": node.router_inflight_work,
                 "estimated_cost": assignment.estimated_cost,
+                "estimated_cost_unit": estimated_cost_unit,
                 "kv_cache_usage": node.kv_cache_usage,
                 "metrics_status": node.metrics_status.value,
                 "gpu_catalog_status": node.gpu_catalog_status.value,
@@ -514,6 +571,17 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         tracker.release_route(node.node_id, assignment.inflight_work)
         raise
 
+    observation = RequestObservation(
+        request_id=request_id,
+        prefix_id=raw_request.headers.get("x-prefix-id"),
+        trace_id=raw_request.headers.get("x-trace-id"),
+        node_id=node.node_id,
+        request_started_at=request_started_at,
+        assignment_completed_at=assignment_completed_at,
+        upstream_opened_at=time.perf_counter(),
+        upstream_status=response.status,
+    )
+
     content_type = response.headers.get("Content-Type")
     if content_type:
         response_headers["Content-Type"] = content_type
@@ -525,6 +593,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 tracker,
                 node.node_id,
                 assignment.inflight_work,
+                observation,
             ),
             status_code=response.status,
             headers=response_headers,
@@ -535,6 +604,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         tracker,
         node.node_id,
         assignment.inflight_work,
+        observation,
     )
     return Response(
         content=content,

@@ -33,6 +33,10 @@ request cost
 
 同窗口首次Prefix Miss没有确定的执行期共享。`inflight_prefix_reuse_probability`默认值为零，因此Policy不会把潜在复用计入收益。后续执行层提供等待、合并或缓存就绪协议后，该参数才能使用实测概率标定。
 
+## 决策反馈
+
+Router使用同一个`request_id`关联选点快照与执行结果。选点快照记录聚合等待、目标节点、分介质Prefix命中和预测成本；执行结果记录上游连接耗时、首个非空OpenAI输出事件耗时、完整响应耗时和完成状态。该记录支持按节点、命中路径和窗口大小检验预测误差。非流式请求只产生完整响应耗时，首输出字段保持空值。
+
 ## 一致性边界
 
 GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节点的GPU目录状态标记为`degraded`。LMCache查询失败时，对应缓存域标记为`degraded`，当前窗口按外部缓存Miss处理。Router状态接口分别输出GPU目录状态和LMCache目录状态。
