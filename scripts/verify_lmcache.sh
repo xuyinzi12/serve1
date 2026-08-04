@@ -11,6 +11,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+bash "$ROOT/scripts/stop.sh"
+
 stop_compute_plane() {
   local pid_file pid
   for pid_file in "$ROOT/runtime"/pids/vllm-*.pid \
