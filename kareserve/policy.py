@@ -224,7 +224,8 @@ class TieredCompletionTimePolicy(KareserveBasePolicy):
         capacity_high_watermark: float = 0.80,
         capacity_hard_limit: float = 0.95,
         capacity_penalty: float = 2.0,
-        queue_smoothing: float = 0.2,
+        queue_history_size: int = 128,
+        queue_local_min_samples: int = 8,
         include_external_cache: bool = True,
     ) -> None:
         super().__init__(cost_model)
@@ -235,7 +236,10 @@ class TieredCompletionTimePolicy(KareserveBasePolicy):
         )
         self.capacity_penalty = max(0.0, capacity_penalty)
         self.include_external_cache = include_external_cache
-        self.queue_estimator = OnlineQueueTimeEstimator(queue_smoothing)
+        self.queue_estimator = OnlineQueueTimeEstimator(
+            history_size=queue_history_size,
+            local_min_samples=queue_local_min_samples,
+        )
 
     @staticmethod
     def _fits_capacity(candidate: RouteCandidate, free_blocks: int | None) -> bool:

@@ -37,7 +37,8 @@
     "capacity_penalty": 2.0,
     "kv_cache_high_watermark": 0.8,
     "kv_cache_hard_limit": 0.95,
-    "queue_smoothing": 0.2,
+    "queue_history_size": 128,
+    "queue_local_min_samples": 8,
     "prefix_block_size": 16,
     "prefix_hash_tokens": 256
   },

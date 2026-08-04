@@ -59,7 +59,8 @@ class RouterConfig:
     capacity_penalty: float = 2.0
     kv_cache_high_watermark: float = 0.80
     kv_cache_hard_limit: float = 0.95
-    queue_smoothing: float = 0.2
+    queue_history_size: int = 128
+    queue_local_min_samples: int = 8
     prefix_hash_tokens: int = 256
     hardware_profile: dict[str, Any] = field(default_factory=dict)
 
@@ -180,7 +181,10 @@ def load_config(config_path: str) -> RouterConfig:
         capacity_penalty=float(routing.get("capacity_penalty", 2.0)),
         kv_cache_high_watermark=float(routing.get("kv_cache_high_watermark", 0.80)),
         kv_cache_hard_limit=float(routing.get("kv_cache_hard_limit", 0.95)),
-        queue_smoothing=float(routing.get("queue_smoothing", 0.2)),
+        queue_history_size=int(routing.get("queue_history_size", 128)),
+        queue_local_min_samples=int(
+            routing.get("queue_local_min_samples", 8)
+        ),
         prefix_hash_tokens=int(routing.get("prefix_hash_tokens", 256)),
         hardware_profile=data.get("hardware_profile", {}),
     )
@@ -198,7 +202,8 @@ def build_policy(config: RouterConfig) -> KareserveBasePolicy:
         "capacity_penalty": config.capacity_penalty,
         "capacity_high_watermark": config.kv_cache_high_watermark,
         "capacity_hard_limit": config.kv_cache_hard_limit,
-        "queue_smoothing": config.queue_smoothing,
+        "queue_history_size": config.queue_history_size,
+        "queue_local_min_samples": config.queue_local_min_samples,
     }
     if policy_name == "tiered_completion_time":
         return TieredCompletionTimePolicy(
