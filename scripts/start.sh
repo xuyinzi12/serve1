@@ -62,7 +62,8 @@ start_lmcache() {
 
 start_vllm() {
   local gpu="$1" http_port="$2" event_port="$3" replay_port="$4"
-  local name="vllm-gpu$gpu" pid_file="$RUNTIME/pids/$name.pid"
+  local name="vllm-gpu$gpu"
+  local pid_file="$RUNTIME/pids/$name.pid"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
     return
   fi

@@ -16,9 +16,9 @@ from kareserve.state import PrefixMatch, SchedulerRequest
 class CacheDomainConfig:
     domain_id: str
     http_url: str
+    model_id: str
     world_size: int = 1
     cache_salt: str = ""
-    model_name: str | None = None
 
 
 class LMCacheLookupClient:
@@ -64,16 +64,10 @@ class LMCacheLookupClient:
             queries = []
             expected_request_ids = set(prompt_lengths)
             for request in requests:
-                request_model = request.raw_body.get("model")
-                model_name = domain.model_name or request_model
-                if not isinstance(model_name, str) or not model_name:
-                    raise ValueError(
-                        f"No LMCache model name for request {request.request_id}"
-                    )
                 queries.append(
                     {
                         "request_id": request.request_id,
-                        "model_name": model_name,
+                        "model_name": domain.model_id,
                         "world_size": domain.world_size,
                         "token_ids": request.prompt_tokens,
                         "cache_salt": domain.cache_salt,

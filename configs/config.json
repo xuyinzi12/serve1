@@ -13,7 +13,7 @@
     "local-memory": {
       "http_url": "http://127.0.0.1:8080",
       "world_size": 1,
-      "model_name": "kareserve-opt-1.3b"
+      "model_id": "/home/zn/llm_models/opt-1.3b"
     }
   },
   "tokenizer": {

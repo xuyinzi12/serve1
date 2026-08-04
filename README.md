@@ -36,7 +36,7 @@ docs/architecture.md   状态来源与路由逻辑
 
 ## 配置
 
-`configs/config.json` 是唯一配置文件。`nodes` 描述当前运行的 vLLM 实例；单实例配置包含一个节点，增加实例时向同一数组增加节点。`cache_domains` 描述各节点使用的 LMCache 服务；同一台主机内共享一个 LMCache 的实例使用相同的 `cache_domain_id`。
+`configs/config.json` 是唯一配置文件。`nodes` 描述当前运行的 vLLM 实例；单实例配置包含一个节点，增加实例时向同一数组增加节点。`cache_domains` 描述各节点使用的 LMCache 服务；同一台主机内共享一个 LMCache 的实例使用相同的 `cache_domain_id`。缓存域的`model_id`使用vLLM加载模型时的模型路径，该值对应LMCache布局注册键。
 
 `hardware_profile.host_memory_to_gpu_bandwidth_gbps` 表示 KVCache 从主机运行内存复制到 GPU 显存的有效带宽。`prefill_ms_per_token` 表示当前模型在目标 GPU 上执行 Prefill 的平均每 Token 时间。当前值为空，Policy统一使用归一化工作量，Router输出的代价不解释为毫秒。后续取得Prefill实测值后，Policy才启用基于时间的介质成本。
 

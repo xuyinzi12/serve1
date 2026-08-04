@@ -110,14 +110,13 @@ def load_config(config_path: str) -> RouterConfig:
         "chat_template_path"
     )
     routing = data.get("routing", {})
-    model_name_override = os.environ.get("KARESERVE_MODEL_NAME")
     cache_domains = {
         domain_id: CacheDomainConfig(
             domain_id=domain_id,
             http_url=str(domain["http_url"]),
             world_size=max(1, int(domain.get("world_size", 1))),
             cache_salt=str(domain.get("cache_salt", "")),
-            model_name=model_name_override or domain.get("model_name"),
+            model_id=str(domain["model_id"]),
         )
         for domain_id, domain in data.get("cache_domains", {}).items()
     }
