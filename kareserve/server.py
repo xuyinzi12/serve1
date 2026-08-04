@@ -40,6 +40,7 @@ logging.basicConfig(level=logging.INFO)
 class RouterConfig:
     nodes: list[dict[str, Any]]
     tokenizer_path: str
+    tokenizer_max_model_len: int
     tokenizer_revision: str | None = None
     tokenizer_trust_remote_code: bool = False
     chat_template_path: str | None = None
@@ -135,6 +136,7 @@ def load_config(config_path: str) -> RouterConfig:
     return RouterConfig(
         nodes=nodes,
         tokenizer_path=tokenizer_path,
+        tokenizer_max_model_len=max(1, int(tokenizer.get("max_model_len", 2048))),
         tokenizer_revision=tokenizer.get("revision"),
         tokenizer_trust_remote_code=bool(tokenizer.get("trust_remote_code", False)),
         chat_template_path=_resolve_optional_path(configured_template, path),
@@ -220,6 +222,7 @@ async def lifespan(app: FastAPI):
     config = load_config(config_path)
     tokenizer = LocalRequestTokenizer(
         config.tokenizer_path,
+        max_model_len=config.tokenizer_max_model_len,
         revision=config.tokenizer_revision,
         trust_remote_code=config.tokenizer_trust_remote_code,
         chat_template_path=config.chat_template_path,
@@ -388,6 +391,45 @@ async def parse_json_request(raw_request: Request) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="JSON payload must be an object")
     return body
+
+
+@app.post("/tokenize")
+async def tokenize(raw_request: Request) -> Response:
+    try:
+        body = await parse_json_request(raw_request)
+        tokens = raw_request.app.state.tokenizer.encode_request(body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload: dict[str, Any] = {
+        "count": len(tokens),
+        "max_model_len": raw_request.app.state.tokenizer.max_model_len,
+        "tokens": tokens,
+        "token_strs": None,
+    }
+    if body.get("return_token_strs"):
+        payload["token_strs"] = raw_request.app.state.tokenizer.token_strings(tokens)
+    return Response(
+        content=json.dumps(payload),
+        media_type="application/json",
+    )
+
+
+@app.post("/detokenize")
+async def detokenize(raw_request: Request) -> Response:
+    body = await parse_json_request(raw_request)
+    tokens = body.get("tokens")
+    if not isinstance(tokens, list) or not all(
+        isinstance(token, int) and token >= 0 for token in tokens
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="tokens must be non-negative integers",
+        )
+    prompt = raw_request.app.state.tokenizer.decode_tokens(tokens)
+    return Response(
+        content=json.dumps({"prompt": prompt}),
+        media_type="application/json",
+    )
 
 
 async def handle_completion(raw_request: Request, endpoint: str) -> Response:

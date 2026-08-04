@@ -17,7 +17,8 @@
     }
   },
   "tokenizer": {
-    "path": "/home/zn/llm_models/opt-1.3b"
+    "path": "/home/zn/llm_models/opt-1.3b",
+    "max_model_len": 2048
   },
   "routing": {
     "policy": "windowed_prefix",

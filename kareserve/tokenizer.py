@@ -12,6 +12,7 @@ class LocalRequestTokenizer:
         self,
         model_path: str,
         *,
+        max_model_len: int = 2048,
         revision: str | None = None,
         trust_remote_code: bool = False,
         chat_template_path: str | None = None,
@@ -24,6 +25,7 @@ class LocalRequestTokenizer:
             revision=revision,
             trust_remote_code=trust_remote_code,
         )
+        self.max_model_len = max(1, max_model_len)
         self.chat_template = None
         if chat_template_path:
             self.chat_template = Path(chat_template_path).read_text(encoding="utf-8")
@@ -35,6 +37,15 @@ class LocalRequestTokenizer:
         if "prompt" in body:
             return self._encode_completion(body)
         raise ValueError("Request must contain messages or prompt")
+
+    def decode_tokens(self, tokens: list[int]) -> str:
+        return str(self.tokenizer.decode(tokens))
+
+    def token_strings(self, tokens: list[int]) -> list[str]:
+        values = self.tokenizer.convert_ids_to_tokens(tokens)
+        if isinstance(values, str):
+            return [values]
+        return [str(value) for value in values]
 
     def _encode_completion(self, body: dict[str, Any]) -> list[int]:
         prompt = body.get("prompt")

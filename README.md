@@ -71,7 +71,7 @@ bash scripts/stop.sh
 
 ## 接口
 
-Router 透传`POST /v1/completions`和`POST /v1/chat/completions`，并提供`GET /health`和`GET /routing/state`。当前 OPT 基础联调使用 Completion 请求。Chat 请求需要模型 Tokenizer 自带 Chat Template，或通过`KARESERVE_CHAT_TEMPLATE`为 Router 与 vLLM 同时指定同一模板。
+Router 透传`POST /v1/completions`和`POST /v1/chat/completions`，并提供`POST /tokenize`、`POST /detokenize`、`GET /health`和`GET /routing/state`。Tokenizer接口由Router本地执行，Benchmark和Prefix路由共用同一Token序列。当前 OPT 基础联调使用 Completion 请求。Chat 请求需要模型 Tokenizer 自带 Chat Template，或通过`KARESERVE_CHAT_TEMPLATE`为 Router 与 vLLM 同时指定同一模板。
 
 Router 负责请求聚合、Prefix 分组、缓存状态查询、实例选择和 HTTP 转发。vLLM 负责实际执行批次。LMCache Connector 负责主机内存或磁盘中的 KVCache 加载。
 

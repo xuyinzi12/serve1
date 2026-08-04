@@ -122,6 +122,7 @@ for gpu in $GPU_IDS; do
     0) start_vllm 0 8101 5557 6557 ;;
     1) start_vllm 1 8102 5558 6558 ;;
     2) start_vllm 2 8103 5559 6559 ;;
+    3) start_vllm 3 8104 5560 6560 ;;
   esac
 done
 for gpu in $GPU_IDS; do
@@ -129,6 +130,7 @@ for gpu in $GPU_IDS; do
     0) wait_for_health http://127.0.0.1:8101/health vLLM-GPU0 ;;
     1) wait_for_health http://127.0.0.1:8102/health vLLM-GPU1 ;;
     2) wait_for_health http://127.0.0.1:8103/health vLLM-GPU2 ;;
+    3) wait_for_health http://127.0.0.1:8104/health vLLM-GPU3 ;;
   esac
 done
 
