@@ -34,6 +34,7 @@
     "kv_cache_hard_limit": 0.95,
     "decode_token_weight": 4.0,
     "inflight_prefix_reuse_probability": 0.0,
+    "inflight_work_to_queue_time_scale": 0.4,
     "group_block_size": 16,
     "prefix_hash_tokens": 256
   },

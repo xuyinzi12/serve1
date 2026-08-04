@@ -227,6 +227,7 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         kv_cache_high_watermark: float = 0.80,
         kv_cache_hard_limit: float = 0.95,
         inflight_prefix_reuse_probability: float = 0.0,
+        inflight_work_to_queue_time_scale: float = 1.0,
     ) -> None:
         super().__init__(cost_model)
         self.queue_weight = max(queue_weight, 0.0)
@@ -238,6 +239,9 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         )
         self.inflight_prefix_reuse_probability = min(
             max(inflight_prefix_reuse_probability, 0.0), 1.0
+        )
+        self.inflight_work_to_queue_time_scale = max(
+            inflight_work_to_queue_time_scale, 0.0
         )
 
     def _capacity_pressure(
@@ -278,7 +282,9 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         request_pressure = 0.25 * candidate.node.router_active_requests
         return RouteCostBreakdown(
             prefill_cost=self.cost_model.candidate_prefill_cost(candidate),
-            router_load_cost=virtual_work,
+            router_load_cost=(
+                virtual_work * self.inflight_work_to_queue_time_scale
+            ),
             engine_queue_cost=self.queue_weight
             * (candidate.node.queue_depth + request_pressure),
             capacity_cost=self._capacity_pressure(candidate, free_blocks),

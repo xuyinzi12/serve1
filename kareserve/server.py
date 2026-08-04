@@ -63,6 +63,7 @@ class RouterConfig:
     kv_cache_hard_limit: float = 0.95
     decode_token_weight: float = 4.0
     inflight_prefix_reuse_probability: float = 0.0
+    inflight_work_to_queue_time_scale: float = 1.0
     prefix_hash_tokens: int = 256
     hardware_profile: dict[str, Any] = field(default_factory=dict)
 
@@ -187,6 +188,9 @@ def load_config(config_path: str) -> RouterConfig:
         inflight_prefix_reuse_probability=float(
             routing.get("inflight_prefix_reuse_probability", 0.0)
         ),
+        inflight_work_to_queue_time_scale=max(
+            0.0, float(routing.get("inflight_work_to_queue_time_scale", 1.0))
+        ),
         prefix_hash_tokens=int(routing.get("prefix_hash_tokens", 256)),
         hardware_profile=data.get("hardware_profile", {}),
     )
@@ -209,6 +213,9 @@ def build_policy(config: RouterConfig) -> KareserveBasePolicy:
             kv_cache_hard_limit=config.kv_cache_hard_limit,
             inflight_prefix_reuse_probability=(
                 config.inflight_prefix_reuse_probability
+            ),
+            inflight_work_to_queue_time_scale=(
+                config.inflight_work_to_queue_time_scale
             ),
         )
     if policy_name == "round_robin":
