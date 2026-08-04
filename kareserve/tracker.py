@@ -190,7 +190,12 @@ class KareserveTracker:
         if node is None:
             return
         node.router_active_requests = max(0, node.router_active_requests - 1)
-        node.router_inflight_work = max(0.0, node.router_inflight_work - max(0.0, work))
+        if node.router_active_requests == 0:
+            node.router_inflight_work = 0.0
+        else:
+            node.router_inflight_work = max(
+                0.0, node.router_inflight_work - max(0.0, work)
+            )
 
     def set_lmcache_lookup_status(self, failed_domains: set[str]) -> None:
         for domain_id in self.lmcache_catalog_status:
