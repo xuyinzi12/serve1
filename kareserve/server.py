@@ -34,6 +34,7 @@ from kareserve.state import NodeRoutingState, NodeState, SchedulerRequest
 from kareserve.tokenizer import LocalRequestTokenizer
 from kareserve.tracker import KareserveTracker
 from kareserve.routing import AssignmentResult, RoutePlanner
+from kareserve.request_pool import RequestPool
 
 logger = logging.getLogger("kareserve.server")
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +57,7 @@ class RouterConfig:
     expected_output_tokens: int = 16
     prefix_tokens_per_load_unit: float = 256.0
     prefix_block_size: int = 16
+    max_planning_group_size: int = 64
     capacity_penalty: float = 2.0
     kv_cache_high_watermark: float = 0.80
     kv_cache_hard_limit: float = 0.95
@@ -178,6 +180,9 @@ def load_config(config_path: str) -> RouterConfig:
             routing.get("prefix_tokens_per_load_unit", 256.0)
         ),
         prefix_block_size=int(routing.get("prefix_block_size", 16)),
+        max_planning_group_size=max(
+            1, int(routing.get("max_planning_group_size", 64))
+        ),
         capacity_penalty=float(routing.get("capacity_penalty", 2.0)),
         kv_cache_high_watermark=float(routing.get("kv_cache_high_watermark", 0.80)),
         kv_cache_hard_limit=float(routing.get("kv_cache_hard_limit", 0.95)),
@@ -276,11 +281,16 @@ async def lifespan(app: FastAPI):
         prefix_block_size=config.prefix_block_size,
         lmcache_lookup=lmcache_lookup,
     )
+    request_pool = RequestPool(
+        route_planner,
+        max_planning_group_size=config.max_planning_group_size,
+    )
 
     app.state.config = config
     app.state.tokenizer = tokenizer
     app.state.tracker = tracker
     app.state.route_planner = route_planner
+    app.state.request_pool = request_pool
     app.state.policy = policy
     app.state.lmcache_lookup = lmcache_lookup
     for node in config.nodes:
@@ -291,6 +301,7 @@ async def lifespan(app: FastAPI):
                 endpoint,
                 node.get("kv_replay_endpoint"),
             )
+    request_pool.start()
     metrics_task = asyncio.create_task(
         poll_metrics(app.state), name="kareserve-metrics"
     )
@@ -300,6 +311,7 @@ async def lifespan(app: FastAPI):
         metrics_task.cancel()
         with suppress(asyncio.CancelledError):
             await metrics_task
+        await request_pool.stop()
         await tracker.stop()
         if lmcache_lookup is not None:
             await lmcache_lookup.close()
@@ -426,6 +438,12 @@ def route_headers(
         "X-Request-Id": request_id,
         "X-Kareserve-Worker-Id": node.node_id,
         "X-Kareserve-Policy": policy_name,
+        "X-Kareserve-Planning-Group-Size": str(
+            assignment.planning_group_size
+        ),
+        "X-Kareserve-Coordination-Wait-Ms": (
+            f"{assignment.coordination_wait_ms:.3f}"
+        ),
         "X-Kareserve-Planning-Ms": f"{assignment.planning_total_ms:.3f}",
         "X-Kareserve-GPU-Prefix-Tokens": str(match.gpu_prefix_tokens),
         "X-Kareserve-CPU-Prefix-Tokens": str(match.cpu_prefix_tokens),
@@ -498,7 +516,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     tracker: KareserveTracker = raw_request.app.state.tracker
     config: RouterConfig = raw_request.app.state.config
     tokenizer: LocalRequestTokenizer = raw_request.app.state.tokenizer
-    route_planner: RoutePlanner = raw_request.app.state.route_planner
+    request_pool: RequestPool = raw_request.app.state.request_pool
     try:
         prompt_tokens = await asyncio.to_thread(tokenizer.encode_request, body)
     except (TypeError, ValueError) as exc:
@@ -522,7 +540,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         raw_body=body,
     )
     try:
-        assignment = await route_planner.assign(scheduler_request)
+        assignment = await request_pool.assign(scheduler_request)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -544,6 +562,10 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "policy": config.policy,
                 "node_id": node.node_id,
                 "cache_domain_id": node.cache_domain_id,
+                "planning_group_size": assignment.planning_group_size,
+                "coordination_wait_ms": round(
+                    assignment.coordination_wait_ms, 3
+                ),
                 "tokenization_ms": round(
                     (tokenization_completed_at - request_started_at) * 1000.0,
                     3,
@@ -646,11 +668,13 @@ async def health_check(request: Request):
     tracker: KareserveTracker = request.app.state.tracker
     config: RouterConfig = request.app.state.config
     route_planner: RoutePlanner = request.app.state.route_planner
+    request_pool: RequestPool = request.app.state.request_pool
     return {
         "status": "ok",
         "nodes": list(tracker.get_routing_states()),
         "policy": config.policy,
         "route_planner": route_planner.stats(),
+        "request_pool": request_pool.stats(),
     }
 
 
@@ -659,6 +683,7 @@ async def routing_state(request: Request):
     tracker: KareserveTracker = request.app.state.tracker
     config: RouterConfig = request.app.state.config
     route_planner: RoutePlanner = request.app.state.route_planner
+    request_pool: RequestPool = request.app.state.request_pool
     states = tracker.get_routing_states()
     return {
         "policy": config.policy,
@@ -705,4 +730,5 @@ async def routing_state(request: Request):
             for node_id in states
         },
         "route_planner": route_planner.stats(),
+        "request_pool": request_pool.stats(),
     }

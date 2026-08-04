@@ -1,12 +1,12 @@
 # KaReserve
 
-KaReserve 是位于客户端与多个 vLLM 实例之间的 KVCache 感知路由器。Router 在每个请求到达时查询 GPU Prefix Cache、可选的 LMCache 缓存目录和实例负载，再把请求转发到预计完成时间最低的实例。vLLM 独立执行 Continuous Batching 和模型推理。
+KaReserve 是位于客户端与多个 vLLM 实例之间的 KVCache 感知路由器。Router 协调当前已经就绪的并发请求，查询 GPU Prefix Cache、可选的 LMCache 缓存目录和实例负载，再执行联合选点。vLLM 独立执行 Continuous Batching 和模型推理。
 
 ```text
 Client
   → OpenAI HTTP
   → KaReserve Router
-     Tokenizer → Cache State → Route Planner → vLLM instance
+     Tokenizer → Request Pool → Cache State → Route Planner → vLLM instance
                          ↘ LMCache memory / disk
 ```
 
@@ -15,7 +15,8 @@ Client
 ```text
 kareserve/
   server.py           HTTP 接口和组件生命周期
-  routing.py          单请求候选构造、选点和资源预留
+  request_pool.py     无固定窗口的并发请求协调
+  routing.py          批量候选构造、联合选点和原子资源预留
   policy.py           路由基线与分层完成时间策略
   performance.py      Prefill 与在线排队时间模型
   tracker.py          GPU 缓存目录和实例运行状态
@@ -38,11 +39,11 @@ docs/architecture.md  路由状态与代价模型
 预计完成时间 = Prompt 路径时间 + 排队时间 + 容量压力
 ```
 
-Prompt 路径包含缓存加载和剩余 Prefill。排队时间由 vLLM 队列指标与请求完成记录共同估计。Router 不使用聚合窗口，也不控制 vLLM 的执行批次。
+Prompt 路径包含缓存加载和剩余 Prefill。排队时间由 vLLM 队列指标与请求完成记录共同估计。Request Pool 不设置毫秒等待窗口；它在首个请求出队后让出一次事件循环，并收集此时已经就绪的请求。单请求直接规划，多请求执行冲突优先的联合分配。Router 不控制 vLLM 的执行批次。
 
 ## 配置
 
-`configs/config.json`描述 vLLM 节点、LMCache 缓存域、Tokenizer、路由参数和硬件性能档案。增加实例时只需要向`nodes`添加节点。共享同一个 LMCache 服务的实例使用相同的`cache_domain_id`。
+`configs/config.json`描述 vLLM 节点、LMCache 缓存域、Tokenizer、路由参数和硬件性能档案。增加实例时只需要向`nodes`添加节点。共享同一个 LMCache 服务的实例使用相同的`cache_domain_id`。`max_planning_group_size`限制一次联合规划处理的请求数，它不表示 vLLM 执行 Batch 大小。
 
 `hardware_profile.prefill_time_model`保存当前模型与 GPU 组合的 Prefill 测量结果；`host_memory_to_gpu_bandwidth_gbps`表示主机运行内存到 GPU 显存的 KVCache 有效传输带宽；`medium_profiles`描述文件系统或对象存储路径。完整的介质成本比较需要这些数值使用同一台部署机器的实测结果。
 
@@ -91,4 +92,4 @@ bash scripts/stop.sh
 
 Router 透传`POST /v1/completions`和`POST /v1/chat/completions`，提供`POST /tokenize`、`POST /detokenize`、`GET /health`和`GET /routing/state`。响应头包含目标实例、分介质 Prefix 命中、预计成本和路由规划时间。
 
-结构化日志使用相同的`request_id`关联`route_decision`与`route_result`。选点记录包含缓存路径、预测成本和规划耗时；执行记录包含首个有效输出时间、完整响应时间和完成状态。在线排队模型的样本数、斜率和误差位于`/routing/state`的`route_planner.queue_estimator`。
+结构化日志使用相同的`request_id`关联`route_decision`与`route_result`。选点记录包含规划组大小、协调等待、缓存路径、预测成本和规划耗时；执行记录包含首个有效输出时间、完整响应时间和完成状态。在线排队模型和 Request Pool 统计位于`/routing/state`。

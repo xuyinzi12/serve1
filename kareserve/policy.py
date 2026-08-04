@@ -318,37 +318,58 @@ class TieredCompletionTimePolicy(KareserveBasePolicy):
                 free_blocks.setdefault(node.node_id, node.estimated_gpu_free_blocks)
 
         assignments: dict[str, RouteAssignment] = {}
-        for request in requests:
-            eligible = self._eligible(candidates.get(request.request_id, {}).values())
-            fitting = [
-                item for item in eligible
-                if self._fits_capacity(item, free_blocks.get(item.node.node_id))
-            ]
-            if fitting:
-                eligible = fitting
-            if not eligible:
-                continue
-
-            evaluated = [
-                (
-                    item,
-                    self._breakdown(
-                        item,
-                        reserved_work[item.node.node_id],
-                        free_blocks.get(item.node.node_id),
-                    ),
+        pending = {request.request_id: request for request in requests}
+        while pending:
+            request_options: dict[
+                str, list[tuple[RouteCandidate, RouteCostBreakdown]]
+            ] = {}
+            priorities: list[tuple[int, float, str]] = []
+            for request in pending.values():
+                eligible = self._eligible(
+                    candidates.get(request.request_id, {}).values()
                 )
-                for item in eligible
-            ]
-            candidate, breakdown = min(
-                evaluated,
-                key=lambda value: (
-                    value[1].total,
-                    active_requests[value[0].node.node_id],
-                    value[0].node.queue_depth,
-                    value[0].node.node_id,
-                ),
-            )
+                fitting = [
+                    item for item in eligible
+                    if self._fits_capacity(
+                        item, free_blocks.get(item.node.node_id)
+                    )
+                ]
+                if fitting:
+                    eligible = fitting
+                if not eligible:
+                    continue
+                evaluated = [
+                    (
+                        item,
+                        self._breakdown(
+                            item,
+                            reserved_work[item.node.node_id],
+                            free_blocks.get(item.node.node_id),
+                        ),
+                    )
+                    for item in eligible
+                ]
+                evaluated.sort(
+                    key=lambda value: (
+                        value[1].total,
+                        active_requests[value[0].node.node_id],
+                        value[0].node.queue_depth,
+                        value[0].node.node_id,
+                    )
+                )
+                request_options[request.request_id] = evaluated
+                regret = (
+                    evaluated[1][1].total - evaluated[0][1].total
+                    if len(evaluated) > 1
+                    else float("inf")
+                )
+                priorities.append((len(evaluated), -regret, request.request_id))
+
+            if not priorities:
+                break
+            _, _, request_id = min(priorities)
+            request = pending.pop(request_id)
+            candidate, breakdown = request_options[request_id][0]
             assignment = self._assignment(
                 request, candidate, breakdown.total, breakdown
             )

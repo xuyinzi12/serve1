@@ -40,6 +40,7 @@
     "queue_history_size": 128,
     "queue_local_min_samples": 8,
     "prefix_block_size": 16,
+    "max_planning_group_size": 64,
     "prefix_hash_tokens": 256
   },
   "hardware_profile": {
