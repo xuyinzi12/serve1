@@ -39,6 +39,7 @@ def main() -> None:
         help="vLLM metrics base URL; defaults to --base-url",
     )
     parser.add_argument("--phase", required=True)
+    parser.add_argument("--stream", action="store_true")
     args = parser.parse_args()
     metrics_url = args.metrics_url or args.base_url
 
@@ -51,7 +52,7 @@ def main() -> None:
         "prompt": f"{shared_prefix}\nQuestion: return one word.\nAnswer:",
         "max_tokens": 8,
         "temperature": 0,
-        "stream": False,
+        "stream": args.stream,
     }
     request = urllib.request.Request(
         f"{args.base_url}/v1/completions",
@@ -61,14 +62,51 @@ def main() -> None:
     )
     started = time.perf_counter()
     with urllib.request.urlopen(request, timeout=120) as response:
-        response_body = json.loads(response.read().decode("utf-8"))
+        response_headers = {
+            key.lower(): value for key, value in response.headers.items()
+        }
+        first_output_ms = None
+        completion_id = None
+        if args.stream:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                payload = json.loads(data)
+                completion_id = completion_id or payload.get("id")
+                choices = payload.get("choices", [])
+                if first_output_ms is None and any(
+                    choice.get("text")
+                    or (
+                        isinstance(choice.get("delta"), dict)
+                        and choice["delta"].get("content")
+                    )
+                    for choice in choices
+                ):
+                    first_output_ms = (time.perf_counter() - started) * 1000.0
+        else:
+            response_body = json.loads(response.read().decode("utf-8"))
+            completion_id = response_body.get("id")
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     print(
         json.dumps(
             {
                 "phase": args.phase,
                 "elapsed_ms": round(elapsed_ms, 3),
-                "completion_id": response_body.get("id"),
+                "first_output_ms": (
+                    round(first_output_ms, 3)
+                    if first_output_ms is not None
+                    else None
+                ),
+                "completion_id": completion_id,
+                "route": {
+                    key: value
+                    for key, value in response_headers.items()
+                    if key.startswith("x-kareserve-")
+                },
                 "metrics": get_metrics(metrics_url),
             },
             sort_keys=True,
