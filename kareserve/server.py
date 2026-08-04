@@ -451,7 +451,9 @@ async def parse_json_request(raw_request: Request) -> dict[str, Any]:
 async def tokenize(raw_request: Request) -> Response:
     try:
         body = await parse_json_request(raw_request)
-        tokens = raw_request.app.state.tokenizer.encode_request(body)
+        tokens = await asyncio.to_thread(
+            raw_request.app.state.tokenizer.encode_request, body
+        )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     payload: dict[str, Any] = {
@@ -461,7 +463,9 @@ async def tokenize(raw_request: Request) -> Response:
         "token_strs": None,
     }
     if body.get("return_token_strs"):
-        payload["token_strs"] = raw_request.app.state.tokenizer.token_strings(tokens)
+        payload["token_strs"] = await asyncio.to_thread(
+            raw_request.app.state.tokenizer.token_strings, tokens
+        )
     return Response(
         content=json.dumps(payload),
         media_type="application/json",
@@ -479,7 +483,9 @@ async def detokenize(raw_request: Request) -> Response:
             status_code=400,
             detail="tokens must be non-negative integers",
         )
-    prompt = raw_request.app.state.tokenizer.decode_tokens(tokens)
+    prompt = await asyncio.to_thread(
+        raw_request.app.state.tokenizer.decode_tokens, tokens
+    )
     return Response(
         content=json.dumps({"prompt": prompt}),
         media_type="application/json",
@@ -494,7 +500,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     tokenizer: LocalRequestTokenizer = raw_request.app.state.tokenizer
     request_pool: RequestPool = raw_request.app.state.request_pool
     try:
-        prompt_tokens = tokenizer.encode_request(body)
+        prompt_tokens = await asyncio.to_thread(tokenizer.encode_request, body)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     tokenization_completed_at = time.perf_counter()

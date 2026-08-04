@@ -41,6 +41,8 @@ Router使用同一个`request_id`关联选点快照与执行结果。选点快�
 
 聚合窗口从首个请求进入Request Pool的时刻开始。Request Pool按照各请求的入池时间划定批次，工作协程自身的事件循环调度延迟不会延长窗口边界。
 
+本地Tokenizer在工作线程中执行。HTTP事件循环继续处理Request Pool、指标采集和上游流式代理，突发请求的同步分词不会串行阻塞路由任务。
+
 ## 一致性边界
 
 GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节点的GPU目录状态标记为`degraded`。LMCache查询失败时，对应缓存域标记为`degraded`，当前窗口按外部缓存Miss处理。Router状态接口分别输出GPU目录状态和LMCache目录状态。
