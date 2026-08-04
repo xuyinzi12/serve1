@@ -6,7 +6,7 @@ KaReserve位于客户端与完整vLLM实例之间。Router管理集群级选点�
 
 请求进入Router后，Tokenizer生成与vLLM一致的Token ID；Request Pool按时间上限或数量上限形成一个路由窗口；Tracker与LMCache Lookup生成请求到各节点的Prefix命中状态；Policy计算窗口内分配；Router按目标实例并发转发独立HTTP请求。vLLM随后执行Continuous Batching。
 
-窗口内的Prefix分组属于路由约束。共享Prefix的请求倾向于进入同一实例。该分组不等同于vLLM执行Batch，也不改变请求协议。
+窗口内的Prefix分组提供请求相关性。Policy同时计算独立分配方案和共同节点方案，并累计组内请求产生的排队工作量与Block占用。共同节点方案只有在预计成本更低时生效。该分组不改变请求协议，vLLM仍然独立执行每个请求的Prefix Cache Lookup。
 
 ## 状态来源
 
@@ -23,14 +23,15 @@ LMCache状态来自项目扩展的只读查询接口。查询接口使用LMCache
 ```text
 request cost
 = prompt path cost
-+ expected decode work
 + vLLM queue and Router inflight work
 + GPU KVCache capacity pressure
 ```
 
-硬件 Profile 使用 KVCache 字节数、介质带宽和固定延迟计算传输时间。`host_memory_to_gpu_bandwidth_gbps`描述主机运行内存到GPU显存的有效带宽；`prefill_ms_per_token`描述当前模型的实测Prefill时间。Profile缺少完整实测值时，Policy使用归一化工作单位。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。
+硬件 Profile 使用 KVCache 字节数、介质带宽和固定延迟计算传输时间。`host_memory_to_gpu_bandwidth_gbps`描述主机运行内存到GPU显存的有效带宽；`prefill_time_model`使用离线样本拟合请求长度与GPU命中长度对应的Prefill TTFT。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。预计输出长度进入Router在途工作量，用于影响后续请求的节点选择。
 
-`windowed_prefix`先按公共Token Prefix形成逻辑组，再选择组内总代价最低的共同节点。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
+`windowed_prefix`使用逐块分区识别逻辑组，请求分支失去共享关系后停止扫描，避免为每个块边界复制完整Token前缀。Policy比较可拆分方案与共同节点方案，并使用虚拟工作量模拟组内排队增长。已知Block容量不足时共同节点方案失效；所有节点容量指标均不足时，Policy保留带容量惩罚的可用节点，避免过期指标直接造成服务中断。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
+
+同窗口首次Prefix Miss没有确定的执行期共享。`inflight_prefix_reuse_probability`默认值为零，因此Policy不会把潜在复用计入收益。后续执行层提供等待、合并或缓存就绪协议后，该参数才能使用实测概率标定。
 
 ## 一致性边界
 

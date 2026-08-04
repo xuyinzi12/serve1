@@ -38,7 +38,9 @@ docs/architecture.md   状态来源与路由逻辑
 
 `configs/config.json` 是唯一配置文件。`nodes` 描述当前运行的 vLLM 实例；单实例配置包含一个节点，增加实例时向同一数组增加节点。`cache_domains` 描述各节点使用的 LMCache 服务；同一台主机内共享一个 LMCache 的实例使用相同的 `cache_domain_id`。缓存域的`model_id`使用vLLM加载模型时的模型路径，该值对应LMCache布局注册键。
 
-`hardware_profile.host_memory_to_gpu_bandwidth_gbps` 表示 KVCache 从主机运行内存复制到 GPU 显存的有效带宽。`prefill_ms_per_token` 表示当前模型在目标 GPU 上执行 Prefill 的平均每 Token 时间。当前值为空，Policy统一使用归一化工作量，Router输出的代价不解释为毫秒。后续取得Prefill实测值后，Policy才启用基于时间的介质成本。
+`hardware_profile.host_memory_to_gpu_bandwidth_gbps` 表示 KVCache 从主机运行内存复制到 GPU 显存的有效带宽。`prefill_time_model`保存当前模型与GPU组合的离线二阶回归结果，模型输入为请求长度和GPU Prefix命中长度，输出为预计Prefill TTFT。主机内存与文件系统传输使用KVCache字节数、实测带宽和固定延迟计算毫秒成本。
+
+`routing.inflight_prefix_reuse_probability`表示Router对执行中Prefix可被同窗口后续请求复用的估计概率。当前vLLM没有提供该执行协议，默认值保持为`0.0`。Policy仍执行窗口级联合分配，并在共置造成排队或容量压力时拆分Prefix组。
 
 ## 基础联调
 
@@ -55,6 +57,12 @@ curl http://127.0.0.1:8090/routing/state
 
 ```bash
 bash scripts/run_benchmark.sh
+```
+
+Prefill模型使用空闲vLLM实例离线标定：
+
+```bash
+.venv-vllm-0.26/bin/python scripts/profile_prefill.py --endpoint http://127.0.0.1:8101 --model kareserve-opt-1.3b --tokenizer /home/zn/llm_models/opt-1.3b --output runtime/prefill-profile.json
 ```
 
 LMCache 跨 vLLM 进程恢复检查使用：

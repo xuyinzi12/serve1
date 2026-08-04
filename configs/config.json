@@ -33,13 +33,31 @@
     "kv_cache_high_watermark": 0.8,
     "kv_cache_hard_limit": 0.95,
     "decode_token_weight": 4.0,
+    "inflight_prefix_reuse_probability": 0.0,
     "group_block_size": 16,
     "prefix_hash_tokens": 256
   },
   "hardware_profile": {
     "host_memory_to_gpu_bandwidth_gbps": 22.4,
     "host_memory_to_gpu_latency_ms": 0.046,
-    "prefill_ms_per_token": null,
+    "prefill_time_model": {
+      "type": "polynomial_v1",
+      "token_scale": 1920.0,
+      "minimum_ms": 12.8099322319,
+      "coefficients_ms": {
+        "intercept": 12.0444729228,
+        "prompt": 23.5194610222,
+        "cached": -23.1590498747,
+        "prompt_squared": 3.6669522609,
+        "prompt_cached": 6.0505562387,
+        "cached_squared": -15.1458455555
+      },
+      "fit": {
+        "sample_count": 28,
+        "rmse_ms": 2.0056557969,
+        "max_absolute_error_ms": 4.9399024883
+      }
+    },
     "num_layers": 24,
     "hidden_size": 2048,
     "kv_dtype_bytes": 2,

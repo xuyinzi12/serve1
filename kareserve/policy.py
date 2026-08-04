@@ -9,15 +9,31 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from kareserve.performance import PolynomialPrefillModel
 from kareserve.state import (
     CacheMedium,
     MetricsStatus,
+    PrefixMatch,
     RouteAssignment,
     RouteCandidate,
     SchedulerRequest,
 )
 
 CandidateMatrix = dict[str, dict[str, RouteCandidate]]
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixGroup:
+    requests: tuple[SchedulerRequest, ...]
+    shared_prefix_tokens: int
+
+
+@dataclass(slots=True)
+class _AssignmentPlan:
+    score: float
+    assignments: dict[str, RouteAssignment]
+    virtual_work: dict[str, float]
+    virtual_free_blocks: dict[str, int | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +48,7 @@ class CostModel:
     compute_ms_per_token: float | None = None
     kv_bytes_per_token: float | None = None
     medium_profiles: dict[str, dict[str, float]] | None = None
+    prefill_model: PolynomialPrefillModel | None = None
 
     @classmethod
     def from_hardware_profile(
@@ -76,6 +93,7 @@ class CostModel:
             compute_ms_per_token=compute_ms,
             kv_bytes_per_token=kv_bytes,
             medium_profiles=medium_profiles,
+            prefill_model=PolynomialPrefillModel.from_profile(profile),
         )
 
     def compute_cost(self, tokens: int) -> float:
@@ -83,13 +101,17 @@ class CostModel:
             return max(0, tokens) * self.compute_ms_per_token
         return max(0, tokens) / self.tokens_per_work_unit
 
+    def prefill_cost(self, prompt_tokens: int, cached_prefix_tokens: int) -> float:
+        if self.prefill_model is not None:
+            return self.prefill_model.predict_ms(prompt_tokens, cached_prefix_tokens)
+        return self.compute_cost(prompt_tokens - cached_prefix_tokens)
+
     def transfer_cost(self, medium: CacheMedium, tokens: int) -> float:
         tokens = max(0, tokens)
         profile = (self.medium_profiles or {}).get(medium.value)
         if (
             profile
             and self.kv_bytes_per_token is not None
-            and self.compute_ms_per_token is not None
         ):
             bandwidth = float(profile.get("bandwidth_gbps", 0.0))
             if bandwidth > 0:
@@ -104,34 +126,43 @@ class CostModel:
         }
         return tokens * weights.get(medium, 0.0) / self.tokens_per_work_unit
 
-    def candidate_work(
-        self, request: SchedulerRequest, candidate: RouteCandidate
+    def prefix_cost(
+        self, match: PrefixMatch, prompt_tokens: int | None = None
     ) -> float:
-        match = candidate.prefix_match
-        external_prefix = match.external_prefix_tokens
-        if external_prefix > match.gpu_prefix_tokens:
-            gpu_load_tokens = external_prefix - match.gpu_prefix_tokens
+        total_tokens = match.prompt_tokens if prompt_tokens is None else prompt_tokens
+        gpu_prefix = min(match.gpu_prefix_tokens, total_tokens)
+        cpu_prefix = min(match.cpu_prefix_tokens, total_tokens)
+        fs_prefix = min(match.fs_prefix_tokens, total_tokens)
+        obj_prefix = min(match.obj_prefix_tokens, total_tokens)
+        external_prefix = max(cpu_prefix, fs_prefix, obj_prefix)
+        if external_prefix > gpu_prefix:
+            gpu_load_tokens = external_prefix - gpu_prefix
             prompt_cost = self.transfer_cost(
                 CacheMedium.CPU, gpu_load_tokens
             )
-            l1_prefix = max(match.gpu_prefix_tokens, match.cpu_prefix_tokens)
+            l1_prefix = max(gpu_prefix, cpu_prefix)
             if external_prefix > l1_prefix:
                 l2_options = [
                     self.transfer_cost(medium, external_prefix - l1_prefix)
                     for medium, prefix_tokens in (
-                        (CacheMedium.FS, match.fs_prefix_tokens),
-                        (CacheMedium.OBJ, match.obj_prefix_tokens),
+                        (CacheMedium.FS, fs_prefix),
+                        (CacheMedium.OBJ, obj_prefix),
                     )
                     if prefix_tokens == external_prefix
                 ]
                 prompt_cost += min(l2_options)
-            prompt_cost += self.compute_cost(
-                match.prompt_tokens - external_prefix
-            )
+            prompt_cost += self.prefill_cost(total_tokens, external_prefix)
         else:
-            prompt_cost = self.compute_cost(
-                match.prompt_tokens - match.gpu_prefix_tokens
-            )
+            prompt_cost = self.prefill_cost(total_tokens, gpu_prefix)
+        return prompt_cost
+
+    def candidate_prefill_cost(self, candidate: RouteCandidate) -> float:
+        return self.prefix_cost(candidate.prefix_match)
+
+    def candidate_work(
+        self, request: SchedulerRequest, candidate: RouteCandidate
+    ) -> float:
+        prompt_cost = self.candidate_prefill_cost(candidate)
         decode_cost = self.compute_cost(
             int(self.decode_token_weight * request.max_tokens)
         )
@@ -192,6 +223,7 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         kv_cache_weight: float = 2.0,
         kv_cache_high_watermark: float = 0.80,
         kv_cache_hard_limit: float = 0.95,
+        inflight_prefix_reuse_probability: float = 0.0,
     ) -> None:
         super().__init__(cost_model)
         self.queue_weight = max(queue_weight, 0.0)
@@ -201,27 +233,37 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         self.kv_cache_hard_limit = min(
             max(kv_cache_hard_limit, self.kv_cache_high_watermark), 1.0
         )
+        self.inflight_prefix_reuse_probability = min(
+            max(inflight_prefix_reuse_probability, 0.0), 1.0
+        )
 
-    def _capacity_pressure(self, candidate: RouteCandidate) -> float:
+    def _capacity_pressure(
+        self, candidate: RouteCandidate, free_blocks: int | None
+    ) -> float:
         node = candidate.node
-        usage = node.kv_cache_usage
+        usage = (
+            1.0 - free_blocks / node.gpu_total_blocks
+            if free_blocks is not None
+            and node.gpu_total_blocks is not None
+            and node.gpu_total_blocks > 0
+            else node.kv_cache_usage
+        )
         if usage is None or usage <= self.kv_cache_high_watermark:
             return 0.0
         remaining = max(1.0 - self.kv_cache_high_watermark, 1e-6)
         normalized = (min(usage, 1.0) - self.kv_cache_high_watermark) / remaining
         pressure = self.kv_cache_weight * normalized * normalized
-        free_blocks = node.estimated_gpu_free_blocks
-        required_blocks = candidate.required_new_gpu_blocks
-        if (
-            free_blocks is not None
-            and required_blocks is not None
-            and required_blocks > free_blocks
-        ):
-            pressure += self.kv_cache_weight * (
-                (required_blocks - free_blocks) / max(required_blocks, 1)
-            )
         if usage >= self.kv_cache_hard_limit:
             pressure += self.kv_cache_weight
+        required = candidate.required_new_gpu_blocks
+        if (
+            free_blocks is not None
+            and required is not None
+            and required > free_blocks
+        ):
+            pressure += self.kv_cache_weight * (
+                1.0 + (required - free_blocks) / max(required, 1)
+            )
         return pressure
 
     def _base_load(self, candidate: RouteCandidate, virtual_work: float) -> float:
@@ -235,42 +277,156 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         request: SchedulerRequest,
         candidate: RouteCandidate,
         virtual_work: float,
+        free_blocks: int | None,
     ) -> float:
         return (
             self._base_load(candidate, virtual_work)
-            + self.cost_model.candidate_work(request, candidate)
-            + self._capacity_pressure(candidate)
+            + self.cost_model.candidate_prefill_cost(candidate)
+            + self._capacity_pressure(candidate, free_blocks)
         )
 
     def _shared_prefix_groups(
         self, requests: list[SchedulerRequest]
-    ) -> list[list[SchedulerRequest]]:
-        prefix_counts: dict[tuple[int, ...], int] = {}
-        request_prefixes: dict[str, list[tuple[int, ...]]] = {}
-        for request in requests:
-            prefixes = []
-            for end in range(
-                self.group_block_size,
-                len(request.prompt_tokens) + 1,
-                self.group_block_size,
-            ):
-                prefix = tuple(request.prompt_tokens[:end])
-                prefixes.append(prefix)
-                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-            request_prefixes[request.request_id] = prefixes
+    ) -> list[PrefixGroup]:
+        deepest_group: dict[str, tuple[int, object]] = {}
+        active_groups: list[list[SchedulerRequest]] = [requests]
+        block_start = 0
+        while active_groups:
+            next_groups: list[list[SchedulerRequest]] = []
+            for active_group in active_groups:
+                buckets: dict[tuple[int, ...], list[SchedulerRequest]] = {}
+                for request in active_group:
+                    block_end = block_start + self.group_block_size
+                    if len(request.prompt_tokens) < block_end:
+                        continue
+                    block = tuple(request.prompt_tokens[block_start:block_end])
+                    buckets.setdefault(block, []).append(request)
+                for bucket in buckets.values():
+                    if len(bucket) < 2:
+                        continue
+                    marker = object()
+                    for request in bucket:
+                        deepest_group[request.request_id] = (block_end, marker)
+                    next_groups.append(bucket)
+            active_groups = next_groups
+            block_start += self.group_block_size
 
         grouped: dict[object, list[SchedulerRequest]] = {}
+        shared_lengths: dict[object, int] = {}
         for request in requests:
-            shared = [
-                prefix
-                for prefix in request_prefixes[request.request_id]
-                if prefix_counts[prefix] > 1
-            ]
+            shared = deepest_group.get(request.request_id)
             key: object = (
-                max(shared, key=len) if shared else ("request", request.request_id)
+                shared[1] if shared else ("request", request.request_id)
             )
             grouped.setdefault(key, []).append(request)
-        return sorted(grouped.values(), key=len, reverse=True)
+            shared_lengths[key] = shared[0] if shared else 0
+        values = [
+            PrefixGroup(tuple(group), shared_lengths[key])
+            for key, group in grouped.items()
+        ]
+        return sorted(
+            values,
+            key=lambda group: (
+                group.shared_prefix_tokens,
+                len(group.requests),
+            ),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _fits_capacity(
+        candidate: RouteCandidate, free_blocks: int | None
+    ) -> bool:
+        required = candidate.required_new_gpu_blocks
+        return required is None or free_blocks is None or required <= free_blocks
+
+    def _build_plan(
+        self,
+        group: PrefixGroup,
+        candidates: CandidateMatrix,
+        virtual_work: dict[str, float],
+        virtual_free_blocks: dict[str, int | None],
+        forced_node_id: str | None = None,
+        allow_capacity_fallback: bool = False,
+    ) -> _AssignmentPlan | None:
+        work = dict(virtual_work)
+        free = dict(virtual_free_blocks)
+        assignments: dict[str, RouteAssignment] = {}
+        score = 0.0
+
+        def largest_request(request: SchedulerRequest) -> int:
+            values = candidates.get(request.request_id, {}).values()
+            return max(
+                (candidate.required_new_gpu_blocks or 0 for candidate in values),
+                default=0,
+            )
+
+        ordered_requests = sorted(
+            group.requests,
+            key=largest_request,
+            reverse=True,
+        )
+        for request in ordered_requests:
+            eligible = self._eligible(
+                candidates.get(request.request_id, {}).values()
+            )
+            if forced_node_id is not None:
+                eligible = [
+                    candidate
+                    for candidate in eligible
+                    if candidate.node.node_id == forced_node_id
+                ]
+            if not eligible:
+                return None
+            capacity_eligible = [
+                candidate
+                for candidate in eligible
+                if self._fits_capacity(
+                    candidate, free.get(candidate.node.node_id)
+                )
+            ]
+            if capacity_eligible:
+                eligible = capacity_eligible
+            elif not allow_capacity_fallback:
+                return None
+            candidate = min(
+                eligible,
+                key=lambda item: (
+                    self._candidate_cost(
+                        request,
+                        item,
+                        work[item.node.node_id],
+                        free.get(item.node.node_id),
+                    ),
+                    item.node.node_id,
+                ),
+            )
+            node_id = candidate.node.node_id
+            cost = self._candidate_cost(
+                request,
+                candidate,
+                work[node_id],
+                free.get(node_id),
+            )
+            assignment = self._assignment(request, candidate, cost)
+            assignments[request.request_id] = assignment
+            score += cost
+            work[node_id] += assignment.inflight_work
+            required = candidate.required_new_gpu_blocks
+            if free.get(node_id) is not None and required is not None:
+                free[node_id] = max(0, free[node_id] - required)
+
+        if forced_node_id is not None and group.shared_prefix_tokens > 0:
+            shared_costs = [
+                self.cost_model.prefix_cost(
+                    assignments[request.request_id].candidate.prefix_match,
+                    group.shared_prefix_tokens,
+                )
+                for request in group.requests
+            ]
+            avoidable_cost = sum(shared_costs) - min(shared_costs)
+            score -= self.inflight_prefix_reuse_probability * avoidable_cost
+        return _AssignmentPlan(score, assignments, work, free)
 
     def select_batch(
         self,
@@ -278,42 +434,49 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
         candidates: CandidateMatrix,
     ) -> dict[str, RouteAssignment]:
         virtual_work: dict[str, float] = {}
+        virtual_free_blocks: dict[str, int | None] = {}
         for by_node in candidates.values():
             for candidate in by_node.values():
                 virtual_work.setdefault(
                     candidate.node.node_id,
                     candidate.node.router_inflight_work,
                 )
+                virtual_free_blocks.setdefault(
+                    candidate.node.node_id,
+                    candidate.node.estimated_gpu_free_blocks,
+                )
 
         assignments: dict[str, RouteAssignment] = {}
         for group in self._shared_prefix_groups(requests):
-            common_nodes = set(candidates.get(group[0].request_id, {}))
-            for request in group[1:]:
+            independent = self._build_plan(
+                group,
+                candidates,
+                virtual_work,
+                virtual_free_blocks,
+                allow_capacity_fallback=True,
+            )
+            best_plan = independent
+            common_nodes = set(candidates.get(group.requests[0].request_id, {}))
+            for request in group.requests[1:]:
                 common_nodes &= set(candidates.get(request.request_id, {}))
-            if not common_nodes:
-                continue
-
-            representative = candidates[group[0].request_id]
-            eligible = self._eligible(
-                representative[node_id] for node_id in common_nodes
-            )
-            node_id = min(
-                (item.node.node_id for item in eligible),
-                key=lambda candidate_node_id: sum(
-                    self._candidate_cost(
-                        request,
-                        candidates[request.request_id][candidate_node_id],
-                        virtual_work[candidate_node_id],
+            if len(group.requests) > 1:
+                for node_id in sorted(common_nodes):
+                    colocated = self._build_plan(
+                        group,
+                        candidates,
+                        virtual_work,
+                        virtual_free_blocks,
+                        forced_node_id=node_id,
                     )
-                    for request in group
-                ),
-            )
-            for request in group:
-                candidate = candidates[request.request_id][node_id]
-                cost = self._candidate_cost(request, candidate, virtual_work[node_id])
-                assignment = self._assignment(request, candidate, cost)
-                assignments[request.request_id] = assignment
-                virtual_work[node_id] += assignment.inflight_work
+                    if colocated is not None and (
+                        best_plan is None or colocated.score < best_plan.score
+                    ):
+                        best_plan = colocated
+            if best_plan is None:
+                continue
+            assignments.update(best_plan.assignments)
+            virtual_work = best_plan.virtual_work
+            virtual_free_blocks = best_plan.virtual_free_blocks
         return assignments
 
 
