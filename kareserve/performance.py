@@ -86,3 +86,58 @@ class PolynomialPrefillModel:
             + self.cached_squared_ms * cached * cached
         )
         return max(self.minimum_ms, value)
+
+
+@dataclass(slots=True)
+class _QueueEstimate:
+    slope: float = 0.0
+    samples: int = 0
+    absolute_error_ms: float = 0.0
+
+
+class OnlineQueueTimeEstimator:
+    """Learn queue delay from routed requests without a model-specific constant."""
+
+    def __init__(self, smoothing: float = 0.2) -> None:
+        self.smoothing = min(max(float(smoothing), 0.01), 1.0)
+        self._nodes: dict[str, _QueueEstimate] = {}
+
+    def predict_ms(self, node_id: str, reserved_work: float) -> float:
+        estimate = self._nodes.get(node_id)
+        if estimate is None or estimate.samples == 0:
+            return 0.0
+        return max(0.0, reserved_work) * estimate.slope
+
+    def observe(
+        self,
+        node_id: str,
+        reserved_work: float,
+        observed_queue_ms: float,
+    ) -> None:
+        if reserved_work <= 0 or not math.isfinite(observed_queue_ms):
+            return
+        target = max(0.0, observed_queue_ms)
+        state = self._nodes.setdefault(node_id, _QueueEstimate())
+        previous = state.slope * reserved_work
+        sample_slope = target / reserved_work
+        if state.samples == 0:
+            state.slope = sample_slope
+            state.absolute_error_ms = abs(target - previous)
+        else:
+            alpha = self.smoothing
+            state.slope = (1.0 - alpha) * state.slope + alpha * sample_slope
+            state.absolute_error_ms = (
+                (1.0 - alpha) * state.absolute_error_ms
+                + alpha * abs(target - previous)
+            )
+        state.samples += 1
+
+    def stats(self) -> dict[str, dict[str, float | int]]:
+        return {
+            node_id: {
+                "samples": state.samples,
+                "queue_ms_per_reserved_work": state.slope,
+                "mean_absolute_error_ms": state.absolute_error_ms,
+            }
+            for node_id, state in sorted(self._nodes.items())
+        }

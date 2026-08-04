@@ -21,18 +21,19 @@ from fastapi.responses import Response, StreamingResponse
 
 from kareserve.policy import (
     CostModel,
+    GpuPrefixLoadPolicy,
     KareserveBasePolicy,
     LeastLoadPolicy,
     PrefixHashPolicy,
     RoundRobinPolicy,
-    WindowedPrefixAffinityPolicy,
+    TieredCompletionTimePolicy,
 )
 from kareserve.lmcache_client import CacheDomainConfig, LMCacheLookupClient
 from kareserve.observability import RequestObservation, SSEOutputDetector
 from kareserve.state import NodeRoutingState, NodeState, SchedulerRequest
 from kareserve.tokenizer import LocalRequestTokenizer
 from kareserve.tracker import KareserveTracker
-from kareserve.request_pool import AssignmentResult, RequestPool
+from kareserve.routing import AssignmentResult, RoutePlanner
 
 logger = logging.getLogger("kareserve.server")
 logging.basicConfig(level=logging.INFO)
@@ -50,20 +51,15 @@ class RouterConfig:
     lmcache_lookup_enabled: bool = False
     cache_domains: dict[str, CacheDomainConfig] = field(default_factory=dict)
     lmcache_lookup_timeout_seconds: float = 1.0
-    policy: str = "windowed_prefix"
-    window_ms: float = 0.0
-    max_batch_size: int = 64
+    policy: str = "tiered_completion_time"
     metrics_interval_seconds: float = 0.5
     expected_output_tokens: int = 16
     prefix_tokens_per_load_unit: float = 256.0
-    queue_weight: float = 1.0
-    group_block_size: int = 16
-    kv_cache_weight: float = 2.0
+    prefix_block_size: int = 16
+    capacity_penalty: float = 2.0
     kv_cache_high_watermark: float = 0.80
     kv_cache_hard_limit: float = 0.95
-    decode_token_weight: float = 4.0
-    inflight_prefix_reuse_probability: float = 0.0
-    inflight_work_to_queue_time_scale: float = 1.0
+    queue_smoothing: float = 0.2
     prefix_hash_tokens: int = 256
     hardware_profile: dict[str, Any] = field(default_factory=dict)
 
@@ -159,7 +155,6 @@ def load_config(config_path: str) -> RouterConfig:
             + ", ".join(sorted(missing_domains))
         )
     policy_override = os.environ.get("KARESERVE_POLICY_OVERRIDE")
-    window_override = os.environ.get("KARESERVE_WINDOW_MS_OVERRIDE")
     return RouterConfig(
         nodes=nodes,
         tokenizer_path=tokenizer_path,
@@ -175,30 +170,17 @@ def load_config(config_path: str) -> RouterConfig:
         lmcache_lookup_timeout_seconds=max(
             0.01, float(routing.get("lmcache_lookup_timeout_seconds", 1.0))
         ),
-        policy=policy_override or routing.get("policy", "windowed_prefix"),
-        window_ms=(
-            float(window_override)
-            if window_override is not None
-            else float(routing.get("window_ms", 0.0))
-        ),
-        max_batch_size=int(routing.get("max_batch_size", 64)),
+        policy=policy_override or routing.get("policy", "tiered_completion_time"),
         metrics_interval_seconds=float(routing.get("metrics_interval_seconds", 0.5)),
         expected_output_tokens=max(0, int(routing.get("expected_output_tokens", 16))),
         prefix_tokens_per_load_unit=float(
             routing.get("prefix_tokens_per_load_unit", 256.0)
         ),
-        queue_weight=float(routing.get("queue_weight", 1.0)),
-        group_block_size=int(routing.get("group_block_size", 16)),
-        kv_cache_weight=float(routing.get("kv_cache_weight", 2.0)),
+        prefix_block_size=int(routing.get("prefix_block_size", 16)),
+        capacity_penalty=float(routing.get("capacity_penalty", 2.0)),
         kv_cache_high_watermark=float(routing.get("kv_cache_high_watermark", 0.80)),
         kv_cache_hard_limit=float(routing.get("kv_cache_hard_limit", 0.95)),
-        decode_token_weight=float(routing.get("decode_token_weight", 4.0)),
-        inflight_prefix_reuse_probability=float(
-            routing.get("inflight_prefix_reuse_probability", 0.0)
-        ),
-        inflight_work_to_queue_time_scale=max(
-            0.0, float(routing.get("inflight_work_to_queue_time_scale", 1.0))
-        ),
+        queue_smoothing=float(routing.get("queue_smoothing", 0.2)),
         prefix_hash_tokens=int(routing.get("prefix_hash_tokens", 256)),
         hardware_profile=data.get("hardware_profile", {}),
     )
@@ -208,24 +190,22 @@ def build_policy(config: RouterConfig) -> KareserveBasePolicy:
     cost_model = CostModel.from_hardware_profile(
         config.hardware_profile,
         tokens_per_work_unit=config.prefix_tokens_per_load_unit,
-        decode_token_weight=config.decode_token_weight,
     )
     policy_name = config.policy.lower()
-    if policy_name == "windowed_prefix":
-        return WindowedPrefixAffinityPolicy(
-            cost_model=cost_model,
-            queue_weight=config.queue_weight,
-            group_block_size=config.group_block_size,
-            kv_cache_weight=config.kv_cache_weight,
-            kv_cache_high_watermark=config.kv_cache_high_watermark,
-            kv_cache_hard_limit=config.kv_cache_hard_limit,
-            inflight_prefix_reuse_probability=(
-                config.inflight_prefix_reuse_probability
-            ),
-            inflight_work_to_queue_time_scale=(
-                config.inflight_work_to_queue_time_scale
-            ),
+    policy_options = {
+        "cost_model": cost_model,
+        "prefix_block_size": config.prefix_block_size,
+        "capacity_penalty": config.capacity_penalty,
+        "capacity_high_watermark": config.kv_cache_high_watermark,
+        "capacity_hard_limit": config.kv_cache_hard_limit,
+        "queue_smoothing": config.queue_smoothing,
+    }
+    if policy_name == "tiered_completion_time":
+        return TieredCompletionTimePolicy(
+            **policy_options,
         )
+    if policy_name == "gpu_prefix_load":
+        return GpuPrefixLoadPolicy(**policy_options)
     if policy_name == "round_robin":
         return RoundRobinPolicy(cost_model)
     if policy_name == "prefix_hash":
@@ -285,19 +265,17 @@ async def lifespan(app: FastAPI):
             timeout_seconds=config.lmcache_lookup_timeout_seconds,
         )
         await lmcache_lookup.start()
-    request_pool = RequestPool(
+    route_planner = RoutePlanner(
         tracker=tracker,
         policy=policy,
-        window_ms=config.window_ms,
-        max_batch_size=config.max_batch_size,
-        group_block_size=config.group_block_size,
+        prefix_block_size=config.prefix_block_size,
         lmcache_lookup=lmcache_lookup,
     )
 
     app.state.config = config
     app.state.tokenizer = tokenizer
     app.state.tracker = tracker
-    app.state.request_pool = request_pool
+    app.state.route_planner = route_planner
     app.state.policy = policy
     app.state.lmcache_lookup = lmcache_lookup
     for node in config.nodes:
@@ -308,7 +286,6 @@ async def lifespan(app: FastAPI):
                 endpoint,
                 node.get("kv_replay_endpoint"),
             )
-    request_pool.start()
     metrics_task = asyncio.create_task(
         poll_metrics(app.state), name="kareserve-metrics"
     )
@@ -318,7 +295,6 @@ async def lifespan(app: FastAPI):
         metrics_task.cancel()
         with suppress(asyncio.CancelledError):
             await metrics_task
-        await request_pool.stop()
         await tracker.stop()
         if lmcache_lookup is not None:
             await lmcache_lookup.close()
@@ -372,8 +348,8 @@ async def stream_upstream(
     session: aiohttp.ClientSession,
     response: aiohttp.ClientResponse,
     tracker: KareserveTracker,
-    node_id: str,
-    inflight_work: float,
+    policy: KareserveBasePolicy,
+    assignment: AssignmentResult,
     observation: RequestObservation,
 ) -> AsyncGenerator[bytes, None]:
     output_detector = SSEOutputDetector()
@@ -395,7 +371,13 @@ async def stream_upstream(
     finally:
         response.release()
         await session.close()
-        tracker.release_route(node_id, inflight_work)
+        if observation.first_output_at is not None:
+            policy.observe_first_output(
+                assignment.assignment,
+                (observation.first_output_at - observation.upstream_opened_at)
+                * 1000.0,
+            )
+        tracker.release_route(assignment.node.node_id, assignment.inflight_work)
         _log_route_result(observation, outcome=outcome, error=error)
 
 
@@ -403,8 +385,7 @@ async def read_upstream(
     session: aiohttp.ClientSession,
     response: aiohttp.ClientResponse,
     tracker: KareserveTracker,
-    node_id: str,
-    inflight_work: float,
+    assignment: AssignmentResult,
     observation: RequestObservation,
 ) -> bytes:
     outcome = "completed"
@@ -423,7 +404,7 @@ async def read_upstream(
     finally:
         response.release()
         await session.close()
-        tracker.release_route(node_id, inflight_work)
+        tracker.release_route(assignment.node.node_id, assignment.inflight_work)
         _log_route_result(observation, outcome=outcome, error=error)
 
 
@@ -440,8 +421,7 @@ def route_headers(
         "X-Request-Id": request_id,
         "X-Kareserve-Worker-Id": node.node_id,
         "X-Kareserve-Policy": policy_name,
-        "X-Kareserve-Route-Batch-Size": str(assignment.route_batch_size),
-        "X-Kareserve-Queue-Wait-Ms": f"{assignment.queue_wait_ms:.3f}",
+        "X-Kareserve-Planning-Ms": f"{assignment.planning_total_ms:.3f}",
         "X-Kareserve-GPU-Prefix-Tokens": str(match.gpu_prefix_tokens),
         "X-Kareserve-CPU-Prefix-Tokens": str(match.cpu_prefix_tokens),
         "X-Kareserve-FS-Prefix-Tokens": str(match.fs_prefix_tokens),
@@ -513,7 +493,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
     tracker: KareserveTracker = raw_request.app.state.tracker
     config: RouterConfig = raw_request.app.state.config
     tokenizer: LocalRequestTokenizer = raw_request.app.state.tokenizer
-    request_pool: RequestPool = raw_request.app.state.request_pool
+    route_planner: RoutePlanner = raw_request.app.state.route_planner
     try:
         prompt_tokens = await asyncio.to_thread(tokenizer.encode_request, body)
     except (TypeError, ValueError) as exc:
@@ -537,17 +517,13 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         raw_body=body,
     )
     try:
-        assignment = await request_pool.assign(scheduler_request)
+        assignment = await route_planner.assign(scheduler_request)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     node = assignment.node
     assignment_completed_at = time.perf_counter()
-    estimated_cost_unit = (
-        "ms"
-        if raw_request.app.state.policy.cost_model.prefill_model is not None
-        else "normalized"
-    )
+    estimated_cost_unit = raw_request.app.state.policy.cost_model.unit
     response_headers = route_headers(
         request_id, assignment, config.policy, estimated_cost_unit
     )
@@ -563,13 +539,11 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "policy": config.policy,
                 "node_id": node.node_id,
                 "cache_domain_id": node.cache_domain_id,
-                "route_batch_size": assignment.route_batch_size,
-                "queue_wait_ms": round(assignment.queue_wait_ms, 3),
                 "tokenization_ms": round(
                     (tokenization_completed_at - request_started_at) * 1000.0,
                     3,
                 ),
-                "pool_total_ms": round(assignment.pool_total_ms, 3),
+                "planning_total_ms": round(assignment.planning_total_ms, 3),
                 "cache_lookup_ms": round(assignment.cache_lookup_ms, 3),
                 "candidate_build_ms": round(assignment.candidate_build_ms, 3),
                 "policy_ms": round(assignment.policy_ms, 3),
@@ -582,14 +556,11 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 "router_inflight_work": node.router_inflight_work,
                 "estimated_cost": assignment.estimated_cost,
                 "estimated_cost_unit": estimated_cost_unit,
-                "estimated_prefill_cost": (
-                    cost_breakdown.prefill_cost if cost_breakdown else None
+                "estimated_prompt_path_cost": (
+                    cost_breakdown.prompt_path_cost if cost_breakdown else None
                 ),
-                "estimated_router_load_cost": (
-                    cost_breakdown.router_load_cost if cost_breakdown else None
-                ),
-                "estimated_engine_queue_cost": (
-                    cost_breakdown.engine_queue_cost if cost_breakdown else None
+                "estimated_queue_cost": (
+                    cost_breakdown.queue_cost if cost_breakdown else None
                 ),
                 "estimated_capacity_cost": (
                     cost_breakdown.capacity_cost if cost_breakdown else None
@@ -634,8 +605,8 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
                 session,
                 response,
                 tracker,
-                node.node_id,
-                assignment.inflight_work,
+                raw_request.app.state.policy,
+                assignment,
                 observation,
             ),
             status_code=response.status,
@@ -645,8 +616,7 @@ async def handle_completion(raw_request: Request, endpoint: str) -> Response:
         session,
         response,
         tracker,
-        node.node_id,
-        assignment.inflight_work,
+        assignment,
         observation,
     )
     return Response(
@@ -670,12 +640,12 @@ async def completions(raw_request: Request):
 async def health_check(request: Request):
     tracker: KareserveTracker = request.app.state.tracker
     config: RouterConfig = request.app.state.config
-    request_pool: RequestPool = request.app.state.request_pool
+    route_planner: RoutePlanner = request.app.state.route_planner
     return {
         "status": "ok",
         "nodes": list(tracker.get_routing_states()),
         "policy": config.policy,
-        "request_pool": request_pool.stats(),
+        "route_planner": route_planner.stats(),
     }
 
 
@@ -683,7 +653,7 @@ async def health_check(request: Request):
 async def routing_state(request: Request):
     tracker: KareserveTracker = request.app.state.tracker
     config: RouterConfig = request.app.state.config
-    request_pool: RequestPool = request.app.state.request_pool
+    route_planner: RoutePlanner = request.app.state.route_planner
     states = tracker.get_routing_states()
     return {
         "policy": config.policy,
@@ -729,5 +699,5 @@ async def routing_state(request: Request):
             }
             for node_id in states
         },
-        "request_pool": request_pool.stats(),
+        "route_planner": route_planner.stats(),
     }

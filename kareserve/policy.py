@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Routing policies for the Kareserve gateway."""
+"""Routing policies for the KaReserve gateway."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from kareserve.performance import PolynomialPrefillModel
+from kareserve.performance import OnlineQueueTimeEstimator, PolynomialPrefillModel
 from kareserve.state import (
     CacheMedium,
     MetricsStatus,
@@ -24,32 +24,24 @@ CandidateMatrix = dict[str, dict[str, RouteCandidate]]
 
 
 @dataclass(frozen=True, slots=True)
-class PrefixGroup:
-    requests: tuple[SchedulerRequest, ...]
-    shared_prefix_tokens: int
-
-
-@dataclass(slots=True)
-class _AssignmentPlan:
-    score: float
-    assignments: dict[str, RouteAssignment]
-    virtual_work: dict[str, float]
-    virtual_free_blocks: dict[str, int | None]
-
-
-@dataclass(frozen=True, slots=True)
 class CostModel:
-    """Convert cache loading and model work into one cost unit."""
+    """Convert prompt execution paths into one comparable cost unit."""
 
     tokens_per_work_unit: float = 256.0
-    decode_token_weight: float = 4.0
-    cpu_load_weight: float = 0.25
-    fs_load_weight: float = 2.0
-    obj_load_weight: float = 4.0
     compute_ms_per_token: float | None = None
+    decode_ms_per_token: float | None = None
     kv_bytes_per_token: float | None = None
     medium_profiles: dict[str, dict[str, float]] | None = None
     prefill_model: PolynomialPrefillModel | None = None
+    cpu_load_weight: float = 0.25
+    fs_load_weight: float = 2.0
+    obj_load_weight: float = 4.0
+
+    @property
+    def unit(self) -> str:
+        if self.prefill_model is not None or self.compute_ms_per_token is not None:
+            return "ms"
+        return "normalized"
 
     @classmethod
     def from_hardware_profile(
@@ -57,7 +49,6 @@ class CostModel:
         profile: dict[str, Any],
         *,
         tokens_per_work_unit: float,
-        decode_token_weight: float,
     ) -> CostModel:
         layers = int(profile.get("num_layers", 0))
         hidden_size = int(profile.get("hidden_size", 0))
@@ -67,6 +58,13 @@ class CostModel:
             float(configured_prefill_ms)
             if configured_prefill_ms is not None
             and float(configured_prefill_ms) > 0
+            else None
+        )
+        configured_decode_ms = profile.get("decode_ms_per_token")
+        decode_ms = (
+            float(configured_decode_ms)
+            if configured_decode_ms is not None
+            and float(configured_decode_ms) > 0
             else None
         )
         kv_bytes = None
@@ -87,14 +85,14 @@ class CostModel:
 
         return cls(
             tokens_per_work_unit=max(tokens_per_work_unit, 1.0),
-            decode_token_weight=max(decode_token_weight, 0.0),
-            cpu_load_weight=float(profile.get("cpu_load_weight", 0.25)),
-            fs_load_weight=float(profile.get("fs_load_weight", 2.0)),
-            obj_load_weight=float(profile.get("obj_load_weight", 4.0)),
             compute_ms_per_token=compute_ms,
+            decode_ms_per_token=decode_ms,
             kv_bytes_per_token=kv_bytes,
             medium_profiles=medium_profiles,
             prefill_model=PolynomialPrefillModel.from_profile(profile),
+            cpu_load_weight=float(profile.get("cpu_load_weight", 0.25)),
+            fs_load_weight=float(profile.get("fs_load_weight", 2.0)),
+            obj_load_weight=float(profile.get("obj_load_weight", 4.0)),
         )
 
     def compute_cost(self, tokens: int) -> float:
@@ -110,10 +108,7 @@ class CostModel:
     def transfer_cost(self, medium: CacheMedium, tokens: int) -> float:
         tokens = max(0, tokens)
         profile = (self.medium_profiles or {}).get(medium.value)
-        if (
-            profile
-            and self.kv_bytes_per_token is not None
-        ):
+        if profile and self.kv_bytes_per_token is not None:
             bandwidth = float(profile.get("bandwidth_gbps", 0.0))
             if bandwidth > 0:
                 transfer_ms = (
@@ -127,47 +122,45 @@ class CostModel:
         }
         return tokens * weights.get(medium, 0.0) / self.tokens_per_work_unit
 
-    def prefix_cost(
-        self, match: PrefixMatch, prompt_tokens: int | None = None
+    def prompt_path_cost(
+        self,
+        match: PrefixMatch,
+        *,
+        include_external: bool = True,
     ) -> float:
-        total_tokens = match.prompt_tokens if prompt_tokens is None else prompt_tokens
+        total_tokens = match.prompt_tokens
         gpu_prefix = min(match.gpu_prefix_tokens, total_tokens)
+        if not include_external:
+            return self.prefill_cost(total_tokens, gpu_prefix)
+
         cpu_prefix = min(match.cpu_prefix_tokens, total_tokens)
         fs_prefix = min(match.fs_prefix_tokens, total_tokens)
         obj_prefix = min(match.obj_prefix_tokens, total_tokens)
         external_prefix = max(cpu_prefix, fs_prefix, obj_prefix)
-        if external_prefix > gpu_prefix:
-            gpu_load_tokens = external_prefix - gpu_prefix
-            prompt_cost = self.transfer_cost(
-                CacheMedium.CPU, gpu_load_tokens
-            )
-            l1_prefix = max(gpu_prefix, cpu_prefix)
-            if external_prefix > l1_prefix:
-                l2_options = [
-                    self.transfer_cost(medium, external_prefix - l1_prefix)
-                    for medium, prefix_tokens in (
-                        (CacheMedium.FS, fs_prefix),
-                        (CacheMedium.OBJ, obj_prefix),
-                    )
-                    if prefix_tokens == external_prefix
-                ]
-                prompt_cost += min(l2_options)
-            prompt_cost += self.prefill_cost(total_tokens, external_prefix)
-        else:
-            prompt_cost = self.prefill_cost(total_tokens, gpu_prefix)
-        return prompt_cost
+        if external_prefix <= gpu_prefix:
+            return self.prefill_cost(total_tokens, gpu_prefix)
 
-    def candidate_prefill_cost(self, candidate: RouteCandidate) -> float:
-        return self.prefix_cost(candidate.prefix_match)
+        cost = self.transfer_cost(CacheMedium.CPU, external_prefix - gpu_prefix)
+        memory_prefix = max(gpu_prefix, cpu_prefix)
+        if external_prefix > memory_prefix:
+            l2_costs = [
+                self.transfer_cost(medium, external_prefix - memory_prefix)
+                for medium, prefix_tokens in (
+                    (CacheMedium.FS, fs_prefix),
+                    (CacheMedium.OBJ, obj_prefix),
+                )
+                if prefix_tokens == external_prefix
+            ]
+            cost += min(l2_costs)
+        return cost + self.prefill_cost(total_tokens, external_prefix)
 
-    def candidate_work(
-        self, request: SchedulerRequest, candidate: RouteCandidate
-    ) -> float:
-        prompt_cost = self.candidate_prefill_cost(candidate)
-        decode_cost = self.compute_cost(
-            int(self.decode_token_weight * request.max_tokens)
-        )
-        return prompt_cost + decode_cost
+    def candidate_work(self, request: SchedulerRequest, candidate: RouteCandidate) -> float:
+        work = self.prompt_path_cost(candidate.prefix_match)
+        if self.decode_ms_per_token is not None:
+            work += request.max_tokens * self.decode_ms_per_token
+        elif self.unit == "normalized":
+            work += self.compute_cost(request.max_tokens)
+        return work
 
 
 class KareserveBasePolicy(ABC):
@@ -185,13 +178,10 @@ class KareserveBasePolicy(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def _eligible(
-        candidates: Iterable[RouteCandidate],
-    ) -> list[RouteCandidate]:
+    def _eligible(candidates: Iterable[RouteCandidate]) -> list[RouteCandidate]:
         values = list(candidates)
         available = [
-            item
-            for item in values
+            item for item in values
             if item.node.metrics_status is MetricsStatus.AVAILABLE
         ]
         return available or values
@@ -203,49 +193,59 @@ class KareserveBasePolicy(ABC):
         estimated_cost: float,
         cost_breakdown: RouteCostBreakdown | None = None,
     ) -> RouteAssignment:
-        work = self.cost_model.candidate_work(request, candidate)
         return RouteAssignment(
             candidate=candidate,
-            inflight_work=work,
+            inflight_work=self.cost_model.candidate_work(request, candidate),
             estimated_cost=estimated_cost,
             cost_breakdown=cost_breakdown,
         )
 
+    def observe_first_output(
+        self,
+        assignment: RouteAssignment,
+        upstream_first_output_ms: float,
+    ) -> None:
+        return None
 
-class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
-    """Joint prefix, load, transfer, and capacity routing."""
+    def runtime_stats(self) -> dict[str, Any]:
+        return {}
 
-    name = "windowed_prefix"
+
+class TieredCompletionTimePolicy(KareserveBasePolicy):
+    """Route by cache path, queue delay, and GPU KV capacity."""
+
+    name = "tiered_completion_time"
 
     def __init__(
         self,
         *,
         cost_model: CostModel,
-        queue_weight: float = 1.0,
-        group_block_size: int = 16,
-        kv_cache_weight: float = 2.0,
-        kv_cache_high_watermark: float = 0.80,
-        kv_cache_hard_limit: float = 0.95,
-        inflight_prefix_reuse_probability: float = 0.0,
-        inflight_work_to_queue_time_scale: float = 1.0,
+        prefix_block_size: int = 16,
+        capacity_high_watermark: float = 0.80,
+        capacity_hard_limit: float = 0.95,
+        capacity_penalty: float = 2.0,
+        queue_smoothing: float = 0.2,
+        include_external_cache: bool = True,
     ) -> None:
         super().__init__(cost_model)
-        self.queue_weight = max(queue_weight, 0.0)
-        self.group_block_size = max(1, group_block_size)
-        self.kv_cache_weight = max(0.0, kv_cache_weight)
-        self.kv_cache_high_watermark = min(max(kv_cache_high_watermark, 0.0), 1.0)
-        self.kv_cache_hard_limit = min(
-            max(kv_cache_hard_limit, self.kv_cache_high_watermark), 1.0
+        self.prefix_block_size = max(1, prefix_block_size)
+        self.capacity_high_watermark = min(max(capacity_high_watermark, 0.0), 1.0)
+        self.capacity_hard_limit = min(
+            max(capacity_hard_limit, self.capacity_high_watermark), 1.0
         )
-        self.inflight_prefix_reuse_probability = min(
-            max(inflight_prefix_reuse_probability, 0.0), 1.0
-        )
-        self.inflight_work_to_queue_time_scale = max(
-            inflight_work_to_queue_time_scale, 0.0
-        )
+        self.capacity_penalty = max(0.0, capacity_penalty)
+        self.include_external_cache = include_external_cache
+        self.queue_estimator = OnlineQueueTimeEstimator(queue_smoothing)
 
-    def _capacity_pressure(
-        self, candidate: RouteCandidate, free_blocks: int | None
+    @staticmethod
+    def _fits_capacity(candidate: RouteCandidate, free_blocks: int | None) -> bool:
+        required = candidate.required_new_gpu_blocks
+        return required is None or free_blocks is None or required <= free_blocks
+
+    def _capacity_cost(
+        self,
+        candidate: RouteCandidate,
+        free_blocks: int | None,
     ) -> float:
         node = candidate.node
         usage = (
@@ -255,273 +255,161 @@ class WindowedPrefixAffinityPolicy(KareserveBasePolicy):
             and node.gpu_total_blocks > 0
             else node.kv_cache_usage
         )
-        if usage is None or usage <= self.kv_cache_high_watermark:
+        if usage is None or usage <= self.capacity_high_watermark:
             return 0.0
-        remaining = max(1.0 - self.kv_cache_high_watermark, 1e-6)
-        normalized = (min(usage, 1.0) - self.kv_cache_high_watermark) / remaining
-        pressure = self.kv_cache_weight * normalized * normalized
-        if usage >= self.kv_cache_hard_limit:
-            pressure += self.kv_cache_weight
-        required = candidate.required_new_gpu_blocks
-        if (
-            free_blocks is not None
-            and required is not None
-            and required > free_blocks
-        ):
-            pressure += self.kv_cache_weight * (
-                1.0 + (required - free_blocks) / max(required, 1)
-            )
-        return pressure
+        span = max(1.0 - self.capacity_high_watermark, 1e-6)
+        normalized = (min(usage, 1.0) - self.capacity_high_watermark) / span
+        cost = self.capacity_penalty * normalized * normalized
+        if usage >= self.capacity_hard_limit:
+            cost += self.capacity_penalty
+        return cost
 
-    def _cost_breakdown(
+    def _prompt_path_cost(self, candidate: RouteCandidate) -> float:
+        return self.cost_model.prompt_path_cost(
+            candidate.prefix_match,
+            include_external=self.include_external_cache,
+        )
+
+    def _queue_cost(
         self,
         candidate: RouteCandidate,
-        virtual_work: float,
+        reserved_work: float,
+        prompt_path_cost: float,
+    ) -> float:
+        node = candidate.node
+        local_prediction = self.queue_estimator.predict_ms(
+            node.node_id, reserved_work
+        )
+        waiting = max(0, node.waiting_requests or 0)
+        running = max(1, node.running_requests or 1)
+        engine_prediction = waiting * prompt_path_cost / running
+        return max(local_prediction, engine_prediction)
+
+    def _breakdown(
+        self,
+        candidate: RouteCandidate,
+        reserved_work: float,
         free_blocks: int | None,
     ) -> RouteCostBreakdown:
-        request_pressure = 0.25 * candidate.node.router_active_requests
+        prompt_path = self._prompt_path_cost(candidate)
         return RouteCostBreakdown(
-            prefill_cost=self.cost_model.candidate_prefill_cost(candidate),
-            router_load_cost=(
-                virtual_work * self.inflight_work_to_queue_time_scale
-            ),
-            engine_queue_cost=self.queue_weight
-            * (candidate.node.queue_depth + request_pressure),
-            capacity_cost=self._capacity_pressure(candidate, free_blocks),
+            prompt_path_cost=prompt_path,
+            queue_cost=self._queue_cost(candidate, reserved_work, prompt_path),
+            capacity_cost=self._capacity_cost(candidate, free_blocks),
         )
-
-    def _candidate_cost(
-        self,
-        candidate: RouteCandidate,
-        virtual_work: float,
-        free_blocks: int | None,
-    ) -> float:
-        return self._cost_breakdown(candidate, virtual_work, free_blocks).total
-
-    def _shared_prefix_groups(
-        self, requests: list[SchedulerRequest]
-    ) -> list[PrefixGroup]:
-        deepest_group: dict[str, tuple[int, object]] = {}
-        active_groups: list[list[SchedulerRequest]] = [requests]
-        block_start = 0
-        while active_groups:
-            next_groups: list[list[SchedulerRequest]] = []
-            for active_group in active_groups:
-                buckets: dict[tuple[int, ...], list[SchedulerRequest]] = {}
-                for request in active_group:
-                    block_end = block_start + self.group_block_size
-                    if len(request.prompt_tokens) < block_end:
-                        continue
-                    block = tuple(request.prompt_tokens[block_start:block_end])
-                    buckets.setdefault(block, []).append(request)
-                for bucket in buckets.values():
-                    if len(bucket) < 2:
-                        continue
-                    marker = object()
-                    for request in bucket:
-                        deepest_group[request.request_id] = (block_end, marker)
-                    next_groups.append(bucket)
-            active_groups = next_groups
-            block_start += self.group_block_size
-
-        grouped: dict[object, list[SchedulerRequest]] = {}
-        shared_lengths: dict[object, int] = {}
-        for request in requests:
-            shared = deepest_group.get(request.request_id)
-            key: object = (
-                shared[1] if shared else ("request", request.request_id)
-            )
-            grouped.setdefault(key, []).append(request)
-            shared_lengths[key] = shared[0] if shared else 0
-        values = [
-            PrefixGroup(tuple(group), shared_lengths[key])
-            for key, group in grouped.items()
-        ]
-        return sorted(
-            values,
-            key=lambda group: (
-                group.shared_prefix_tokens,
-                len(group.requests),
-            ),
-            reverse=True,
-        )
-
-    @staticmethod
-    def _fits_capacity(
-        candidate: RouteCandidate, free_blocks: int | None
-    ) -> bool:
-        required = candidate.required_new_gpu_blocks
-        return required is None or free_blocks is None or required <= free_blocks
-
-    def _build_plan(
-        self,
-        group: PrefixGroup,
-        candidates: CandidateMatrix,
-        virtual_work: dict[str, float],
-        virtual_free_blocks: dict[str, int | None],
-        forced_node_id: str | None = None,
-        allow_capacity_fallback: bool = False,
-    ) -> _AssignmentPlan | None:
-        work = dict(virtual_work)
-        free = dict(virtual_free_blocks)
-        assignments: dict[str, RouteAssignment] = {}
-        score = 0.0
-
-        def largest_request(request: SchedulerRequest) -> int:
-            values = candidates.get(request.request_id, {}).values()
-            return max(
-                (candidate.required_new_gpu_blocks or 0 for candidate in values),
-                default=0,
-            )
-
-        ordered_requests = sorted(
-            group.requests,
-            key=largest_request,
-            reverse=True,
-        )
-        for request in ordered_requests:
-            eligible = self._eligible(
-                candidates.get(request.request_id, {}).values()
-            )
-            if forced_node_id is not None:
-                eligible = [
-                    candidate
-                    for candidate in eligible
-                    if candidate.node.node_id == forced_node_id
-                ]
-            if not eligible:
-                return None
-            capacity_eligible = [
-                candidate
-                for candidate in eligible
-                if self._fits_capacity(
-                    candidate, free.get(candidate.node.node_id)
-                )
-            ]
-            if capacity_eligible:
-                eligible = capacity_eligible
-            elif not allow_capacity_fallback:
-                return None
-            candidate = min(
-                eligible,
-                key=lambda item: (
-                    self._candidate_cost(
-                        item,
-                        work[item.node.node_id],
-                        free.get(item.node.node_id),
-                    ),
-                    item.node.node_id,
-                ),
-            )
-            node_id = candidate.node.node_id
-            breakdown = self._cost_breakdown(
-                candidate, work[node_id], free.get(node_id)
-            )
-            cost = breakdown.total
-            assignment = self._assignment(
-                request, candidate, cost, cost_breakdown=breakdown
-            )
-            assignments[request.request_id] = assignment
-            score += cost
-            work[node_id] += assignment.inflight_work
-            required = candidate.required_new_gpu_blocks
-            if free.get(node_id) is not None and required is not None:
-                free[node_id] = max(0, free[node_id] - required)
-
-        if forced_node_id is not None and group.shared_prefix_tokens > 0:
-            shared_costs = [
-                self.cost_model.prefix_cost(
-                    assignments[request.request_id].candidate.prefix_match,
-                    group.shared_prefix_tokens,
-                )
-                for request in group.requests
-            ]
-            avoidable_cost = sum(shared_costs) - min(shared_costs)
-            score -= self.inflight_prefix_reuse_probability * avoidable_cost
-        return _AssignmentPlan(score, assignments, work, free)
 
     def select_batch(
         self,
         requests: list[SchedulerRequest],
         candidates: CandidateMatrix,
     ) -> dict[str, RouteAssignment]:
-        virtual_work: dict[str, float] = {}
-        virtual_free_blocks: dict[str, int | None] = {}
+        reserved_work: dict[str, float] = {}
+        active_requests: dict[str, int] = {}
+        free_blocks: dict[str, int | None] = {}
         for by_node in candidates.values():
             for candidate in by_node.values():
-                virtual_work.setdefault(
-                    candidate.node.node_id,
-                    candidate.node.router_inflight_work,
-                )
-                virtual_free_blocks.setdefault(
-                    candidate.node.node_id,
-                    candidate.node.estimated_gpu_free_blocks,
-                )
+                node = candidate.node
+                reserved_work.setdefault(node.node_id, node.router_inflight_work)
+                active_requests.setdefault(node.node_id, node.router_active_requests)
+                free_blocks.setdefault(node.node_id, node.estimated_gpu_free_blocks)
 
         assignments: dict[str, RouteAssignment] = {}
-        for group in self._shared_prefix_groups(requests):
-            independent = self._build_plan(
-                group,
-                candidates,
-                virtual_work,
-                virtual_free_blocks,
-                allow_capacity_fallback=True,
-            )
-            best_plan = independent
-            common_nodes = set(candidates.get(group.requests[0].request_id, {}))
-            for request in group.requests[1:]:
-                common_nodes &= set(candidates.get(request.request_id, {}))
-            if len(group.requests) > 1:
-                for node_id in sorted(common_nodes):
-                    colocated = self._build_plan(
-                        group,
-                        candidates,
-                        virtual_work,
-                        virtual_free_blocks,
-                        forced_node_id=node_id,
-                    )
-                    if colocated is not None and (
-                        best_plan is None or colocated.score < best_plan.score
-                    ):
-                        best_plan = colocated
-            if best_plan is None:
+        for request in requests:
+            eligible = self._eligible(candidates.get(request.request_id, {}).values())
+            fitting = [
+                item for item in eligible
+                if self._fits_capacity(item, free_blocks.get(item.node.node_id))
+            ]
+            if fitting:
+                eligible = fitting
+            if not eligible:
                 continue
-            assignments.update(best_plan.assignments)
-            virtual_work = best_plan.virtual_work
-            virtual_free_blocks = best_plan.virtual_free_blocks
+
+            evaluated = [
+                (
+                    item,
+                    self._breakdown(
+                        item,
+                        reserved_work[item.node.node_id],
+                        free_blocks.get(item.node.node_id),
+                    ),
+                )
+                for item in eligible
+            ]
+            candidate, breakdown = min(
+                evaluated,
+                key=lambda value: (
+                    value[1].total,
+                    active_requests[value[0].node.node_id],
+                    value[0].node.queue_depth,
+                    value[0].node.node_id,
+                ),
+            )
+            assignment = self._assignment(
+                request, candidate, breakdown.total, breakdown
+            )
+            assignments[request.request_id] = assignment
+            node_id = candidate.node.node_id
+            reserved_work[node_id] += assignment.inflight_work
+            active_requests[node_id] += 1
+            required = candidate.required_new_gpu_blocks
+            if free_blocks.get(node_id) is not None and required is not None:
+                free_blocks[node_id] = max(0, free_blocks[node_id] - required)
         return assignments
+
+    def observe_first_output(
+        self,
+        assignment: RouteAssignment,
+        upstream_first_output_ms: float,
+    ) -> None:
+        breakdown = assignment.cost_breakdown
+        if breakdown is None:
+            return
+        observed_queue_ms = max(
+            0.0, upstream_first_output_ms - breakdown.prompt_path_cost
+        )
+        self.queue_estimator.observe(
+            assignment.candidate.node.node_id,
+            assignment.candidate.node.router_inflight_work,
+            observed_queue_ms,
+        )
+
+    def runtime_stats(self) -> dict[str, Any]:
+        return {"queue_estimator": self.queue_estimator.stats()}
+
+
+class GpuPrefixLoadPolicy(TieredCompletionTimePolicy):
+    """Baseline using GPU Prefix Cache and the same load model."""
+
+    name = "gpu_prefix_load"
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs["include_external_cache"] = False
+        super().__init__(**kwargs)
 
 
 class LeastLoadPolicy(KareserveBasePolicy):
     name = "least_load"
 
-    def select_batch(
-        self,
-        requests: list[SchedulerRequest],
-        candidates: CandidateMatrix,
-    ) -> dict[str, RouteAssignment]:
-        virtual_work: dict[str, float] = {}
+    def select_batch(self, requests, candidates):
         assignments: dict[str, RouteAssignment] = {}
+        active: dict[str, int] = {}
         for request in requests:
             eligible = self._eligible(candidates.get(request.request_id, {}).values())
+            for item in eligible:
+                active.setdefault(item.node.node_id, item.node.router_active_requests)
             if not eligible:
                 continue
-            for candidate in eligible:
-                virtual_work.setdefault(
-                    candidate.node.node_id,
-                    candidate.node.router_inflight_work,
-                )
             candidate = min(
                 eligible,
                 key=lambda item: (
-                    virtual_work[item.node.node_id] + item.node.queue_depth,
+                    active[item.node.node_id] + item.node.queue_depth,
                     item.node.node_id,
                 ),
             )
-            cost = virtual_work[candidate.node.node_id] + candidate.node.queue_depth
-            assignment = self._assignment(request, candidate, cost)
+            assignment = self._assignment(request, candidate, 0.0)
             assignments[request.request_id] = assignment
-            virtual_work[candidate.node.node_id] += assignment.inflight_work
+            active[candidate.node.node_id] += 1
         return assignments
 
 
@@ -532,11 +420,7 @@ class RoundRobinPolicy(KareserveBasePolicy):
         super().__init__(cost_model)
         self._next_index = 0
 
-    def select_batch(
-        self,
-        requests: list[SchedulerRequest],
-        candidates: CandidateMatrix,
-    ) -> dict[str, RouteAssignment]:
+    def select_batch(self, requests, candidates):
         assignments: dict[str, RouteAssignment] = {}
         for request in requests:
             eligible = sorted(
@@ -562,11 +446,7 @@ class PrefixHashPolicy(KareserveBasePolicy):
         super().__init__(cost_model)
         self.prefix_hash_tokens = max(1, prefix_hash_tokens)
 
-    def select_batch(
-        self,
-        requests: list[SchedulerRequest],
-        candidates: CandidateMatrix,
-    ) -> dict[str, RouteAssignment]:
+    def select_batch(self, requests, candidates):
         assignments: dict[str, RouteAssignment] = {}
         for request in requests:
             eligible = sorted(

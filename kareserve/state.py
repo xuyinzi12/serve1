@@ -122,17 +122,15 @@ class RouteCandidate:
 
 @dataclass(frozen=True, slots=True)
 class RouteCostBreakdown:
-    prefill_cost: float
-    router_load_cost: float
-    engine_queue_cost: float
+    prompt_path_cost: float
+    queue_cost: float
     capacity_cost: float
 
     @property
     def total(self) -> float:
         return (
-            self.prefill_cost
-            + self.router_load_cost
-            + self.engine_queue_cost
+            self.prompt_path_cost
+            + self.queue_cost
             + self.capacity_cost
         )
 

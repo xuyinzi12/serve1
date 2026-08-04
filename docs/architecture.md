@@ -1,66 +1,44 @@
 # 系统架构
 
-## 组件边界
+## 执行边界
 
-KaReserve位于客户端与完整vLLM实例之间。Router管理集群级选点，vLLM管理实例内部调度，LMCache管理GPU之外的KVCache。
+KaReserve 管理集群级请求选点，vLLM 管理实例内调度，LMCache 管理 GPU 之外的 KVCache。Router 对每个请求独立执行 Tokenize、缓存状态查询、候选构造、策略计算和 HTTP 转发。Router 不聚合请求，也不声明逻辑组对应 vLLM 的实际执行批次。
 
-请求进入Router后，Tokenizer生成与vLLM一致的Token ID；Request Pool按时间上限或数量上限形成一个路由窗口；Tracker与LMCache Lookup生成请求到各节点的Prefix命中状态；Policy计算窗口内分配；Router按目标实例并发转发独立HTTP请求。vLLM随后执行Continuous Batching。
+GPU 缓存目录来自 vLLM KV Event。Tracker 保存各实例的 Block 链和事件序号，Replay 端点用于恢复 Router 断连期间保留的事件。vLLM 进程代次变化会清空对应实例的 GPU 目录。
 
-窗口内的Prefix分组提供请求相关性。Policy同时计算独立分配方案和共同节点方案，并累计组内请求产生的排队工作量与Block占用。共同节点方案只有在预计成本更低时生效。该分组不改变请求协议，vLLM仍然独立执行每个请求的Prefix Cache Lookup。
-
-## 状态来源
-
-GPU缓存目录来自vLLM KV Event。Tracker保存每个实例的Block链、Token序列和事件序号，Replay端点补齐Router断连期间仍被发布端保留的事件。vLLM进程代次变化会清空对应实例的GPU目录。
-
-LMCache状态来自项目扩展的只读查询接口。查询接口使用LMCache的Token Hasher生成ObjectKey，直接检查主机内存对象状态，并通过L2 Adapter检查文件系统或对象存储。Router对一个窗口中的请求执行批量查询，相同`cache_domain_id`的vLLM实例共享查询结果。该结果表示查询时刻的缓存状态，目标vLLM Connector仍然执行最终Lookup和锁管理。
-
-LMCache数据面和Router目录查询使用独立开关。数据面保持开启时，vLLM Connector继续执行外部缓存存取；Router查询关闭时，Policy只使用GPU目录和节点负载，外部缓存命中由Connector在执行阶段自行完成。
-
-默认部署关闭LMCache数据面。普通ShareGPT样本缺少块对齐外部Prefix复用时，Connector Miss路径会增加请求时延；具备稳定共享Prefix的工作负载通过部署参数显式启用外部缓存。
-
-实例负载来自vLLM`/metrics`和Router本地在途记录。路由输入包含vLLM运行队列、等待队列、GPU KVCache使用率、Router已分配工作量和请求所需新增Block数。缺失指标保持未知状态，Policy不会把未知值解释为零负载或满负载。
+LMCache 状态来自项目扩展的只读查询接口。查询直接检查主机运行内存对象状态和 L2 Adapter，返回连续命中的 Prefix 长度与介质。同一`cache_domain_id`的 vLLM 实例共享查询结果。vLLM Connector 在执行阶段完成最终 Lookup、锁定和加载。
 
 ## 路由代价
 
-每个节点的执行路径由GPU命中和LMCache连续命中共同决定。LMCache先锁定主机内存中的连续前缀，再从L2补齐后续Chunk。Policy分别计算L2到主机内存、主机内存到GPU和剩余Prefill成本，然后比较不同节点的总成本。没有外部命中的节点执行完整剩余Prefill。
+主策略`tiered_completion_time`使用统一成本计算候选实例：
 
 ```text
 request cost
 = prompt path cost
-+ vLLM queue and Router inflight work
-+ GPU KVCache capacity pressure
++ queue cost
++ capacity cost
 ```
 
-硬件 Profile 使用 KVCache 字节数、介质带宽和固定延迟计算传输时间。`host_memory_to_gpu_bandwidth_gbps`描述主机运行内存到GPU显存的有效带宽；`prefill_time_model`使用离线样本拟合请求长度与GPU命中长度对应的Prefill TTFT。磁盘路径包含磁盘到主机内存与主机内存到GPU两段成本。预计输出长度进入Router在途工作量，用于影响后续请求的节点选择。
+Prompt 路径成本由 GPU 命中长度、LMCache 连续命中长度、介质传输和剩余 Prefill 决定。主机内存路径包含主机内存到 GPU；文件系统路径包含文件系统到主机内存和主机内存到 GPU。完整 Miss 执行剩余 Prefix 的 Prefill。
 
-`windowed_prefix`使用逐块分区识别逻辑组，请求分支失去共享关系后停止扫描，避免为每个块边界复制完整Token前缀。Policy比较可拆分方案与共同节点方案，并使用虚拟工作量模拟组内排队增长。已知Block容量不足时共同节点方案失效；所有节点容量指标均不足时，Policy保留带容量惩罚的可用节点，避免过期指标直接造成服务中断。`window_ms=0`关闭聚合等待，同时保留相同的状态采集与策略实现。
+排队成本使用两个状态来源。vLLM 的等待请求数提供已进入引擎的队列状态；Router 的在途工作量覆盖指标刷新前已经转发的请求。在线估计器使用实际首输出路径减去预计 Prompt 路径得到排队样本，并按节点更新“单位预留工作对应的排队毫秒数”。该估计器不绑定模型名称，模型和硬件变化后会重新积累样本。
 
-当前部署默认使用`window_ms=0`。冷启动突发请求和单节点Prefix预热实验中，2毫秒窗口没有改变节点分配，并增加了Router等待时间。执行层提供可验证的执行中Prefix共享，或联合分配实验产生稳定收益后，窗口值再通过配置显式开启。
+GPU Block 容量优先作为候选准入条件。所有候选节点的容量快照均不足时，策略保留最低成本节点，以处理指标滞后。高使用率容量成本用于区分仍可容纳请求的候选节点。
 
-同窗口首次Prefix Miss没有确定的执行期共享。`inflight_prefix_reuse_probability`默认值为零，因此Policy不会把潜在复用计入收益。后续执行层提供等待、合并或缓存就绪协议后，该参数才能使用实测概率标定。
+## 策略基线
 
-## 决策反馈
+`round_robin`按固定顺序分配请求；`gpu_prefix_load`只使用 GPU Prefix 路径并复用同一排队和容量逻辑；`tiered_completion_time`增加外部缓存介质路径。该分层关系使实验能够分别测量 GPU Prefix 感知和分层介质感知的收益。
 
-Router使用同一个`request_id`关联选点快照与执行结果。选点快照记录聚合等待、目标节点、分介质Prefix命中和预测成本；执行结果记录上游连接耗时、首个非空OpenAI输出事件耗时、完整响应耗时和完成状态。该记录支持按节点、命中路径和窗口大小检验预测误差。非流式请求只产生完整响应耗时，首输出字段保持空值。
+## 反馈与一致性
 
-选点快照将Router前置路径拆分为本地分词、聚合等待、LMCache查询、候选状态构造和Policy计算。批量阶段耗时表示整个路由窗口的工作量，同一窗口内的请求共享该值；`pool_total_ms`表示单个请求从进入Request Pool到获得分配结果的完整时间。
+流式响应的首个有效输出用于更新在线排队模型。非流式响应缺少准确首输出时刻，因此只记录完整响应时间。Router 重启会清空在线排队样本，稳定实验需要预热阶段。
 
-预测成本同时输出Prefill路径、Router在途负载、vLLM队列和KVCache容量压力四个分量。该分解用于标定各类状态与实际上游等待的映射，分量保持原始策略单位。
+LMCache 查询与请求抵达 vLLM 之间存在时间差。vLLM Connector承担最终缓存正确性，Router 查询只参与成本估计。文件系统目录能够确认 L2 对象存在，当前接口无法确认 Linux 页缓存驻留状态，因此文件系统成本使用冷读性能档案。
 
-`inflight_work_to_queue_time_scale`将Router累计的模型工作量转换为vLLM排队代价。当前OPT-1.3B双实例标定值为`0.4`，该值来自并发度1、4、8、16和32的实际首输出路径，模型或执行配置变化后需要重新标定。
+## 多实体部署
 
-聚合窗口从首个请求进入Request Pool的时刻开始。Request Pool按照各请求的入池时间划定批次，工作协程自身的事件循环调度延迟不会延长窗口边界。
+每台物理主机拥有独立 GPU、主机运行内存和文件系统，并运行本地 vLLM 与 LMCache 服务。Router 使用`cache_domain_id`关联缓存域，使用各缓存域的查询地址获取分层状态。跨主机 GPU KVCache 迁移当前不在数据路径中；远程对象存储通过 LMCache L2 Adapter进入成本模型。
 
-本地Tokenizer在工作线程中执行。HTTP事件循环继续处理Request Pool、指标采集和上游流式代理，突发请求的同步分词不会串行阻塞路由任务。
+## 后续研究边界
 
-## 一致性边界
-
-GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节点的GPU目录状态标记为`degraded`。LMCache查询失败时，对应缓存域标记为`degraded`，当前窗口按外部缓存Miss处理。Router状态接口分别输出GPU目录状态和LMCache目录状态。
-
-缓存查询与请求抵达vLLM之间存在时间差。LMCache可能在这段时间发生淘汰，vLLM Connector负责最终正确性。Router查询只用于成本估算，不持有跨组件缓存租约。
-
-文件系统介质使用冷读带宽计算路由成本。LMCache目录能够确认L2对象存在，当前接口无法确认对应文件是否仍位于操作系统页缓存。页缓存命中会缩短实际读取时间，Router保持冷读成本以避免依赖不可观测状态。主机内存和文件系统的最终命中量继续由vLLM外部Prefix Cache指标验证。
-
-## 多主机部署
-
-每台物理主机运行本地vLLM和LMCache服务，并拥有独立GPU、主机内存和文件系统。Router配置使用一个`cache_domain_id`关联共享同一LMCache的vLLM实例，使用`cache_domains.<id>.http_url`定位各主机的查询接口。Policy优先利用目标实体已经持有的缓存。当前数据面不提供跨主机GPU迁移，远端对象存储通过LMCache L2 Adapter进入成本模型。
+多请求联合分配需要独立的聚合策略和执行收益证据。现有 vLLM 接口不会保证窗口内首次 Prefix Miss 只计算一次。该方向在受控实验确认收益条件后再进入主路由路径。

@@ -1,12 +1,20 @@
 {
   "nodes": [
     {
-      "node_id": "gpu1",
+      "node_id": "gpu0",
       "host": "127.0.0.1",
-      "port": 8102,
+      "port": 8101,
       "cache_domain_id": "local-memory",
-      "kv_events_endpoint": "tcp://127.0.0.1:5558",
-      "kv_replay_endpoint": "tcp://127.0.0.1:6558"
+      "kv_events_endpoint": "tcp://127.0.0.1:5557",
+      "kv_replay_endpoint": "tcp://127.0.0.1:6557"
+    },
+    {
+      "node_id": "gpu3",
+      "host": "127.0.0.1",
+      "port": 8104,
+      "cache_domain_id": "local-memory",
+      "kv_events_endpoint": "tcp://127.0.0.1:5560",
+      "kv_replay_endpoint": "tcp://127.0.0.1:6560"
     }
   ],
   "cache_domains": {
@@ -21,21 +29,16 @@
     "max_model_len": 2048
   },
   "routing": {
-    "policy": "windowed_prefix",
-    "window_ms": 0.0,
-    "max_batch_size": 64,
+    "policy": "tiered_completion_time",
     "metrics_interval_seconds": 0.5,
     "expected_output_tokens": 16,
     "lmcache_lookup_timeout_seconds": 1.0,
     "prefix_tokens_per_load_unit": 256.0,
-    "queue_weight": 1.0,
-    "kv_cache_weight": 2.0,
+    "capacity_penalty": 2.0,
     "kv_cache_high_watermark": 0.8,
     "kv_cache_hard_limit": 0.95,
-    "decode_token_weight": 4.0,
-    "inflight_prefix_reuse_probability": 0.0,
-    "inflight_work_to_queue_time_scale": 0.4,
-    "group_block_size": 16,
+    "queue_smoothing": 0.2,
+    "prefix_block_size": 16,
     "prefix_hash_tokens": 256
   },
   "hardware_profile": {
