@@ -14,6 +14,8 @@ GPU缓存目录来自vLLM KV Event。Tracker保存每个实例的Block链、Toke
 
 LMCache状态来自项目扩展的只读查询接口。查询接口使用LMCache的Token Hasher生成ObjectKey，直接检查主机内存对象状态，并通过L2 Adapter检查文件系统或对象存储。Router对一个窗口中的请求执行批量查询，相同`cache_domain_id`的vLLM实例共享查询结果。该结果表示查询时刻的缓存状态，目标vLLM Connector仍然执行最终Lookup和锁管理。
 
+LMCache数据面和Router目录查询使用独立开关。数据面保持开启时，vLLM Connector继续执行外部缓存存取；Router查询关闭时，Policy只使用GPU目录和节点负载，外部缓存命中由Connector在执行阶段自行完成。
+
 实例负载来自vLLM`/metrics`和Router本地在途记录。路由输入包含vLLM运行队列、等待队列、GPU KVCache使用率、Router已分配工作量和请求所需新增Block数。缺失指标保持未知状态，Policy不会把未知值解释为零负载或满负载。
 
 ## 路由代价

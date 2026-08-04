@@ -47,7 +47,7 @@ class RouterConfig:
     tokenizer_trust_remote_code: bool = False
     chat_template_path: str | None = None
     allow_request_chat_template: bool = False
-    lmcache_enabled: bool = False
+    lmcache_lookup_enabled: bool = False
     cache_domains: dict[str, CacheDomainConfig] = field(default_factory=dict)
     lmcache_lookup_timeout_seconds: float = 1.0
     policy: str = "windowed_prefix"
@@ -144,8 +144,16 @@ def load_config(config_path: str) -> RouterConfig:
         node.get("cache_domain_id", node["node_id"]) for node in nodes
     }
     missing_domains = node_domains - cache_domains.keys()
-    lmcache_enabled = os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"
-    if lmcache_enabled and missing_domains:
+    lmcache_data_plane_enabled = (
+        os.environ.get("KARESERVE_ENABLE_LMCACHE", "0") == "1"
+    )
+    lookup_override = os.environ.get("KARESERVE_ENABLE_LMCACHE_LOOKUP")
+    lmcache_lookup_enabled = (
+        lmcache_data_plane_enabled
+        if lookup_override is None
+        else lookup_override == "1"
+    )
+    if lmcache_lookup_enabled and missing_domains:
         raise ValueError(
             "LMCache is enabled but cache_domains lacks: "
             + ", ".join(sorted(missing_domains))
@@ -162,7 +170,7 @@ def load_config(config_path: str) -> RouterConfig:
         allow_request_chat_template=bool(
             tokenizer.get("allow_request_chat_template", False)
         ),
-        lmcache_enabled=lmcache_enabled,
+        lmcache_lookup_enabled=lmcache_lookup_enabled,
         cache_domains=cache_domains,
         lmcache_lookup_timeout_seconds=max(
             0.01, float(routing.get("lmcache_lookup_timeout_seconds", 1.0))
@@ -271,7 +279,7 @@ async def lifespan(app: FastAPI):
     tracker = KareserveTracker(initial_nodes)
     policy = build_policy(config)
     lmcache_lookup = None
-    if config.lmcache_enabled:
+    if config.lmcache_lookup_enabled:
         lmcache_lookup = LMCacheLookupClient(
             config.cache_domains,
             timeout_seconds=config.lmcache_lookup_timeout_seconds,
@@ -705,7 +713,7 @@ async def routing_state(request: Request):
         "lmcache": {
             "source": (
                 "lmcache_authoritative_lookup"
-                if config.lmcache_enabled
+                if config.lmcache_lookup_enabled
                 else "disabled"
             ),
             "lookup": (
