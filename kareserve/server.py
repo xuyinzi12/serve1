@@ -51,7 +51,7 @@ class RouterConfig:
     cache_domains: dict[str, CacheDomainConfig] = field(default_factory=dict)
     lmcache_lookup_timeout_seconds: float = 1.0
     policy: str = "windowed_prefix"
-    window_ms: float = 2.0
+    window_ms: float = 0.0
     max_batch_size: int = 64
     metrics_interval_seconds: float = 0.5
     expected_output_tokens: int = 16
@@ -171,7 +171,7 @@ def load_config(config_path: str) -> RouterConfig:
         window_ms=(
             float(window_override)
             if window_override is not None
-            else float(routing.get("window_ms", 2.0))
+            else float(routing.get("window_ms", 0.0))
         ),
         max_batch_size=int(routing.get("max_batch_size", 64)),
         metrics_interval_seconds=float(routing.get("metrics_interval_seconds", 0.5)),

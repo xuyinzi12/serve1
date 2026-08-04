@@ -22,7 +22,7 @@
   },
   "routing": {
     "policy": "windowed_prefix",
-    "window_ms": 2.0,
+    "window_ms": 0.0,
     "max_batch_size": 64,
     "metrics_interval_seconds": 0.5,
     "expected_output_tokens": 16,
