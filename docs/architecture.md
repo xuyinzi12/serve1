@@ -55,6 +55,8 @@ GPU目录依赖KV Event连续性。序号缺口无法通过Replay恢复时，节
 
 缓存查询与请求抵达vLLM之间存在时间差。LMCache可能在这段时间发生淘汰，vLLM Connector负责最终正确性。Router查询只用于成本估算，不持有跨组件缓存租约。
 
+文件系统介质使用冷读带宽计算路由成本。LMCache目录能够确认L2对象存在，当前接口无法确认对应文件是否仍位于操作系统页缓存。页缓存命中会缩短实际读取时间，Router保持冷读成本以避免依赖不可观测状态。主机内存和文件系统的最终命中量继续由vLLM外部Prefix Cache指标验证。
+
 ## 多主机部署
 
 每台物理主机运行本地vLLM和LMCache服务，并拥有独立GPU、主机内存和文件系统。Router配置使用一个`cache_domain_id`关联共享同一LMCache的vLLM实例，使用`cache_domains.<id>.http_url`定位各主机的查询接口。Policy优先利用目标实体已经持有的缓存。当前数据面不提供跨主机GPU迁移，远端对象存储通过LMCache L2 Adapter进入成本模型。
